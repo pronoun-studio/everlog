@@ -1,0 +1,3 @@
+# Build dependency for creating a macOS .app bundle.
+py2app>=0.28
+

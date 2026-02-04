@@ -1,0 +1,20 @@
+# Role: ローカル開発で生成される成果物をgit管理から除外する。
+# How: venv、Pythonキャッシュ、Swiftビルド成果物などを除外する。
+# Collaboration: `ocr/ecocr` の `.build/` やPythonの `__pycache__` がここに該当する。
+.venv/
+__pycache__/
+*.pyc
+.eggs/
+.DS_Store
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+build/
+dist/
+*.egg-info/
+.build/
+
+# ローカル開発用ログディレクトリ（プロジェクト直下に配置した場合）
+EVERYTIME-LOG/
+EVERLOG-LOG/
+.env

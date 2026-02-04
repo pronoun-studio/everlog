@@ -1,0 +1,27 @@
+# Role: PythonパッケージとCLI（`everlog`）のメタ情報・エントリポイントを定義する。
+# How: `project.scripts` で `everlog` コマンドを `everlog/cli.py` に接続する。
+# Key entries: `[project]`, `[project.scripts]`
+# Collaboration: 実装本体は `everlog/` にあり、`pip install -e .` でCLIが利用可能になる。
+[build-system]
+requires = ["setuptools>=69"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "everlog"
+version = "0.1.0"
+description = "macOS screenshot + local OCR worklog (JSONL) and daily Markdown summary"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "Proprietary" }
+authors = [{ name = "arima" }]
+dependencies = []
+
+[project.scripts]
+everlog = "everlog.cli:main"
+# Legacy alias
+everytimecapture = "everlog.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["everlog*", "everytimecapture*"]
+exclude = ["ocr*"]

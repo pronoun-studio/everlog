@@ -1,0 +1,4 @@
+# Role: 追加依存（メニューバーUI）をまとめる。
+# How: v0.1では `rumps` のみを追加し、UIを軽量に実装する。
+# Collaboration: `everlog/menubar.py` が `rumps` を使用する。
+rumps>=0.4.0
