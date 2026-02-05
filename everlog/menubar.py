@@ -4,6 +4,7 @@
 # Collaboration: launchd操作は `everlog/launchd.py`（を呼ぶCLI）に委譲し、設定は `everlog/config.py` を更新する。状態表示と日次生成は `everlog/jsonl.py` / `everlog/summarize.py` の成果物を参照する。
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
@@ -360,10 +361,33 @@ def run_menubar() -> None:
 
         def on_summarize_today(self, _):
             rumps.notification("everlog", "生成開始", "今日のマークダウンを生成中...")
+            trace_env = os.environ.copy()
+            trace_env["EVERLOG_TRACE"] = "1"
+            trace_env["EVERLOG_TRACE_RUN_ID"] = datetime.now().astimezone().strftime("%H%M%S-%f")
+            trace_env["EVERLOG_OUTPUT_RUN_ID"] = trace_env["EVERLOG_TRACE_RUN_ID"]
+            try:
+                run_id = trace_env["EVERLOG_TRACE_RUN_ID"]
+                run_dir = get_paths().trace_dir / _today() / run_id
+                run_dir.mkdir(parents=True, exist_ok=True)
+                (run_dir / "run.json").write_text(
+                    json.dumps(
+                        {
+                            "run_id": run_id,
+                            "source": "menubar",
+                            "started_at": datetime.now().astimezone().isoformat(),
+                        },
+                        ensure_ascii=False,
+                    )
+                    + "\n",
+                    encoding="utf-8",
+                )
+            except Exception as e:
+                _debug(f"trace_run_dir: failed: {e}")
             # enrich (LLM解析) → summarize (Markdown生成) を順次実行
             # enrichが失敗してもsummarizeは実行する（LLMなしでもMarkdownは生成可能）
             enrich_result = subprocess.run(
                 [sys.executable, "-m", "everlog.cli", "enrich", "--date", "today"],
+                env=trace_env,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
@@ -377,12 +401,17 @@ def run_menubar() -> None:
 
             summarize_result = subprocess.run(
                 [sys.executable, "-m", "everlog.cli", "summarize", "--date", "today"],
+                env=trace_env,
                 capture_output=True,
                 text=True,
                 encoding="utf-8",
                 check=False,
             )
-            out = get_paths().out_dir / f"{_today()}.md"
+            run_id = trace_env.get("EVERLOG_OUTPUT_RUN_ID") or trace_env.get("EVERLOG_TRACE_RUN_ID") or ""
+            if run_id:
+                out = get_paths().out_dir / _today() / run_id / f"{_today()}.md"
+            else:
+                out = get_paths().out_dir / f"{_today()}.md"
             if summarize_result.returncode == 0 and out.exists():
                 if enrich_failed:
                     rumps.notification("everlog", "生成完了", "マークダウンを開きます（LLMなし）")

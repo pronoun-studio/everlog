@@ -97,7 +97,7 @@ graph TD
 ```
 
 ## 2. 保存先（ローカル）
-- `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`（イベントログ。互換: `EVERLOG-LOG/...`）
+- `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`（イベントログ）
 - `EVERYTIME-LOG/out/YYYY-MM-DD.md`（日次Markdown）
 - `EVERYTIME-LOG/out/YYYY-MM-DD.llm.json`（LLM要約結果）
 - `EVERYTIME-LOG/tmp/`（一時スクショ。デフォルトで削除）
@@ -187,7 +187,7 @@ graph TD
   - マスキングのON/OFFは `everlog/config.py` で制御する。
 
 ### `everlog/config.py`
-- 役割: `EVERYTIME-LOG/config.json` の読み書き・デフォルト提供（互換: `EVERLOG-LOG/config.json`）
+- 役割: `EVERYTIME-LOG/config.json` の読み書き・デフォルト提供
   - 「間隔」「除外ルール」「マスキング設定」など、運用で変えたい値をJSONにまとめる。
   - 設定が存在しない場合は安全なデフォルトを生成し、UIからすぐ編集できる状態にする。
 - 連携:

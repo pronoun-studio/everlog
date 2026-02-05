@@ -9,7 +9,7 @@ How: 現象→仮説→実施した変更→現状→次の手順 の順で短�
 - 将来的にGUI（メニューバー/設定/状態）を足す前提で「許可を付けられる実行主体（.app）」に寄せる
 
 ## 背景（発生している問題）
-- `EVERLOG-LOG/logs/2026-02-04.jsonl` で `screencapture failed (code=1): could not create image from display` が連続（互換: `EVERYTIME-LOG/...`）
+- `EVERYTIME-LOG/logs/2026-02-04.jsonl` で `screencapture failed (code=1): could not create image from display` が連続
 - macOSの「画面収録とシステムオーディオ録音」画面で `python` / `.venv/bin/python*` を `＋` から追加しようとしても、
   一覧に反映されず（選択が無視される挙動）＝権限を付与できない
 

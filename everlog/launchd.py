@@ -11,7 +11,7 @@ import sys
 from pathlib import Path
 
 from .config import load_config
-from .paths import get_paths
+from .paths import get_paths, _project_root
 
 
 CAPTURE_LABEL = "com.everlog.capture"
@@ -39,18 +39,30 @@ def _python_executable() -> str:
     return sys.executable
 
 
-def _env_dict_xml() -> str:
+def _env_dict_xml(*, include_pythonpath: bool = True) -> str:
     """launchd 実行に必要な環境変数をplistに埋め込む。"""
-    # プロジェクトルートを PYTHONPATH に追加（launchd 経由で everlog モジュールを見つけるため）
-    project_root = Path(__file__).resolve().parent.parent
+    # ログ保存先を固定（CWDや配置に依存しないようにする）
+    log_home = str(get_paths().home)
+
+    log_home_xml = (
+        f"\n    <key>EVERLOG_LOG_HOME</key>\n    <string>{log_home}</string>"
+        f"\n    <key>EVERYTIMECAPTURE_LOG_HOME</key>\n    <string>{log_home}</string>"
+    )
+    pythonpath_xml = ""
+    if include_pythonpath:
+        # プロジェクトルートを PYTHONPATH に追加（launchd 経由で everlog モジュールを見つけるため）
+        # .app 配下でも pyproject/.git を辿れるように _project_root を使う
+        project_root = _project_root()
+        pythonpath_xml = f"\n    <key>PYTHONPATH</key>\n    <string>{project_root}</string>"
     return f"""  <key>EnvironmentVariables</key>
   <dict>
     <key>LANG</key>
     <string>ja_JP.UTF-8</string>
     <key>PYTHONIOENCODING</key>
     <string>utf-8</string>
-    <key>PYTHONPATH</key>
-    <string>{project_root}</string>
+    <key>PYTHONNOUSERSITE</key>
+    <string>1</string>{pythonpath_xml}
+{log_home_xml}
   </dict>"""
 
 
@@ -108,7 +120,8 @@ def _write_plist_capture(interval_sec: int) -> None:
     cfg = load_config()
     args = _capture_program_args(cfg)
     args_xml = "\n".join([f"      <string>{a}</string>" for a in args])
-    env_xml = _env_dict_xml()
+    using_app = bool(getattr(cfg, "capture_app_path", None))
+    env_xml = _env_dict_xml(include_pythonpath=not using_app)
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">

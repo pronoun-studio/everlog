@@ -1,6 +1,6 @@
 <!--
 Role: OCR全文をローカルJSONLに保存する前提で、除外（記録しない）とマスキング（置換して保存）の運用ルールを定義する。
-How: まず安全側のキーワード/アプリ除外を決め、必要に応じて `EVERYTIME-LOG/config.json` に反映して運用で調整する（互換: `EVERLOG-LOG/config.json`）。
+How: まず安全側のキーワード/アプリ除外を決め、必要に応じて `EVERYTIME-LOG/config.json` に反映して運用で調整する。
 Key sections: 除外アプリ、除外ドメイン、マスキング、JSONL反映。
 Collaboration: 実装は `everlog/exclusions.py` と `everlog/redact.py`、設定値は `everlog/config.py` が扱う。
 -->

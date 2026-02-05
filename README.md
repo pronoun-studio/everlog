@@ -22,12 +22,8 @@ pip install -r requirements.txt
 pip install -e .
 ```
 
-初回実行で、プロジェクト直下のログディレクトリ（`EVERYTIME-LOG/` または `EVERLOG-LOG/`）配下を作成します。
-
-### 開発時のログディレクトリ
-開発やPDCA解析のために、プロジェクト直下に `EVERLOG-LOG/` を配置すると自動的にそちらを使用します（`.gitignore` で除外済み）。優先順位:
-1. プロジェクト直下の `EVERLOG-LOG/`（互換: `EVERYTIME-LOG/` を自動検出）
-2. 既知の開発パス（`~/DEV/everytimecapture` など）配下の `EVERLOG-LOG/`
+初回実行で、プロジェクト直下の `EVERYTIME-LOG/` 配下を作成します。
+（保存先を固定したい場合は環境変数 `EVERLOG_LOG_HOME` を設定してください）
 
 ## OCR（ローカル）
 v0.1では「Vision OCRヘルパー（Swift製）」をログディレクトリ配下の `bin/ecocr` に置く想定です。
@@ -62,7 +58,8 @@ export OPENAI_API_KEY="(your key)"
 export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 
 # - もしくは .env に書く（launchd / .app 実行でも拾いやすい。推奨）
-#   例: プロジェクト直下の .env
+#   例: プロジェクト直下の `EVERYTIME-LOG/.env` またはプロジェクト直下の `.env`
+#   （別の場所に固定したい場合は `EVERLOG_LOG_HOME` を設定）
 #   OPENAI_API_KEY=...
 #   EVERLOG_LLM_MODEL=gpt-5-nano
 ./.venv/bin/everlog enrich --date today
@@ -208,7 +205,7 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 ```
 
 ## 保存先
-- ログ: `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`（互換: `EVERLOG-LOG/logs/...`）
+- ログ: `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`
 - 出力: `EVERYTIME-LOG/out/YYYY-MM-DD.md`（LLM結果: `YYYY-MM-DD.llm.json`）
 - 一時: `EVERYTIME-LOG/tmp/`
 - バイナリ: `EVERYTIME-LOG/bin/`（OCRヘルパー `ecocr` など）

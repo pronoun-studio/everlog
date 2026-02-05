@@ -15,7 +15,7 @@ How: まずユーザー影響（コマンド/保存先/権限）→互換性→�
   - 新: `com.everlog.capture` / `com.everlog.menubar` / `com.everlog.daily`
   - 旧: `com.everytimecapture.*`（停止/参照の互換あり）
 - 保存先ディレクトリ（ログ/出力/設定）:
-  - 新デフォルト: プロジェクト直下の `EVERLOG-LOG/`（互換: `EVERYTIME-LOG/`）
+  - 新デフォルト: プロジェクト直下の `EVERYTIME-LOG/`
   - 互換: 旧ディレクトリ名 `EVERYTIME-LOG/` を自動検出して利用
 - 環境変数:
   - 新: `EVERLOG_OCR_BIN`, `EVERLOG_CAPTURE_APP`, `EVERLOG_LLM_MODEL`, `EVERLOG_DATE_OVERRIDE`
@@ -27,8 +27,7 @@ How: まずユーザー影響（コマンド/保存先/権限）→互換性→�
 ## 互換性ポリシー
 - `everytimecapture` パッケージは削除せず、`everlog` へ転送する「互換 shim」として残す。
   - 例: `python -m everytimecapture.cli ...` は `everlog` と同じ挙動になる。
-- `EVERYTIME-LOG/` が存在する場合、`EVERLOG-LOG/` を作る前に既存の `EVERYTIME-LOG/` を優先して使う（ログの連続性を優先）。
-  - `EVERLOG-LOG/` へ移行したい場合は、ディレクトリをリネームする。
+- 既存の `EVERYTIME-LOG/` をそのまま使う（保存先を増やさない）
 
 ## 実装変更（コード/設定）
 ### 1) Python パッケージ構成
@@ -44,8 +43,7 @@ How: まずユーザー影響（コマンド/保存先/権限）→互換性→�
 ### 3) 保存先の決定ロジック
 - `everlog/paths.py`:
   - 優先順位:
-    1. プロジェクト直下 `EVERLOG-LOG/`（互換: `EVERYTIME-LOG/`）
-    2. 既知の開発パス（`~/DEV/...`）配下の `EVERLOG-LOG/`
+    1. プロジェクト直下 `EVERYTIME-LOG/`
 
 ### 4) launchd（ラベル/ログ/互換停止）
 - `everlog/launchd.py`:
@@ -108,7 +106,7 @@ cd macos_app
 - パッケージ/CLI: `pyproject.toml`
 - ドキュメント: `README.md`, `DESIGN.md`, `ARCHITECTURE.md`, `EXCLUSIONS.md`, `SETUP_NOTES.md`, `APPIFICATION.md`, `macos_app/README.md`
 - macOS アプリ: `macos_app/setup.py`, `macos_app/Everlog.py`, `macos_app/build_capture_app.sh`, `macos_app/create_icns.sh`, `macos_app/Everlog.icns`
-- 除外設定: `.gitignore`（`EVERLOG-LOG/` を追加）
+- 除外設定: `.gitignore`（`EVERYTIME-LOG/` を追加）
 
 ## 動作確認（この環境で実施した範囲）
 - `python3 -m everlog.cli summarize --date 2026-02-04` が成功し、`EVERYTIME-LOG/out/2026-02-04.md` を更新できること

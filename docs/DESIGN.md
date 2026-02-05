@@ -33,7 +33,7 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
 
 ## 3. 期待アウトプット（最終形）
 ### 3.1 日次Markdown（例）
-- ファイル名例: `EVERYTIME-LOG/out/2026-02-03.md`（互換: `EVERLOG-LOG/out/...`）
+- ファイル名例: `EVERYTIME-LOG/out/2026-02-03.md`
 - 構成:
   - サマリ（記録期間、キャプチャ数、推定総時間）
   - 本日のメイン作業（推定）: TOP3の作業名と時間（LLM付与時は要約も）
@@ -53,15 +53,15 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
 - **Capture**: 1回のサンプリング（スクショ→OCR→JSONL追記）
 - **Event**: JSONLの1行
 - **Interval**: キャプチャ間隔（デフォルト 5分）
-- **Context**: 前面アプリ、ウィンドウタイトル、（可能なら）ブラウザURL、OCRテキスト
+- **Context**: 前面アプリ、ウィンドウタイトル、（可能なら）ブラウザURL（OCRはディスプレイ別に保持）
 
 ## 5. 全体アーキテクチャ
 ### 5.1 データフロー
 1. スケジューラ（launchd / 手動）で `capture` を起動
 2. 前面アプリ/ウィンドウタイトル/（可能なら）URLを取得（v0.2はChromeのみ）
-3. 画面全体を `screencapture` で一時ファイルに保存
-4. Vision OCRでテキスト抽出
-5. 除外判定（アプリ/ドメイン/キーワード）→ マスキング → JSONLに追記
+3. 全ディスプレイを `screencapture` で一時ファイルに保存（1ディスプレイ=1枚）
+4. ディスプレイごとにVision OCRでテキスト抽出
+5. ディスプレイごとに除外判定/マスキングし、`ocr_by_display` に記録 → JSONLに追記
 6. 一時画像を削除（デフォルト）
 7. 日次で `enrich`（任意）→ `summarize` を実行し、Markdownを生成
    - `enrich`: OpenAI APIでセグメントに作業名/要約を付与（`out/YYYY-MM-DD.llm.json`）
@@ -72,7 +72,7 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
   - AppleScriptで前面アプリ/ウィンドウタイトル取得
   - ブラウザURL取得（Chromeのみ）
 - `capture.py`
-  - `screencapture` 実行、1回分のキャプチャを実行しJSONLに追記
+  - `screencapture` 実行（ディスプレイごとに保存）、OCR/除外/マスクを経てJSONLに追記
 - `ocr.py`
   - Vision OCR（Swift helper `EVERYTIME-LOG/bin/ecocr`）
 - `exclusions.py` / `redact.py`
@@ -129,7 +129,17 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
 - `interval_sec` (number): 設定上の間隔（推定時間計算に利用）
 - `active_app` (string): 例 `Arc`, `Terminal`
 - `window_title` (string): 例 `PR #123 — GitHub`
-- `ocr_text` (string): OCR抽出テキスト（全文）
+- `active_context` (object): アクティブ情報の明示
+  - `app` (string)
+  - `window_title` (string)
+  - `browser` (object | null): `browser` と同じ形式
+- `ocr_by_display` (array[object]): ディスプレイ別OCR
+  - `display` (number): 1始まり
+  - `image` (string): 画像ファイル名
+  - `ocr_text` (string): そのディスプレイのOCRテキスト（除外時は空）
+  - `excluded` (boolean)
+  - `excluded_reason` (string, optional)
+  - `error` (object, optional)
 
 任意（取れれば）:
 - `bundle_id` (string): 例 `company.thebrowser.Browser`
@@ -137,6 +147,7 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
   - `name` (string): `Arc|Chrome|Safari|...`
   - `url` (string): アクティブタブURL
   - `domain` (string): `example.com`
+- `ocr_text` (string): 旧形式の互換用（必要なら `ocr_by_display` から導出）。空文字のことがある。
 - `screen` (object):
   - `width` (number)
   - `height` (number)
@@ -147,7 +158,7 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
 
 ### 7.2 JSONL例
 ```json
-{"id":"b3b0c5e2-0f15-4f6a-8c6b-2e9c44c7d6d9","ts":"2026-02-03T09:15:00-08:00","tz":"-08:00","interval_sec":300,"active_app":"Google Chrome","window_title":"Work Log Spec","browser":{"name":"Chrome","url":"https://www.notion.so/...","domain":"notion.so"},"ocr_text":"everlog 設計仕様 v0.1 ..."}
+{"id":"b3b0c5e2-0f15-4f6a-8c6b-2e9c44c7d6d9","ts":"2026-02-03T09:15:00-08:00","tz":"-08:00","interval_sec":300,"active_app":"Google Chrome","window_title":"Work Log Spec","browser":{"name":"Chrome","url":"https://www.notion.so/...","domain":"notion.so"},"active_context":{"app":"Google Chrome","window_title":"Work Log Spec","browser":{"name":"Chrome","url":"https://www.notion.so/...","domain":"notion.so"}},"ocr_text":"","ocr_by_display":[{"display":1,"image":"b3b0c5e2-...png","ocr_text":"...","excluded":false},{"display":2,"image":"b3b0c5e2-...-d2.png","ocr_text":"","excluded":true,"excluded_reason":"text_kw:password"}]}
 ```
 
 ## 8. 集計ロジック（推定時間）
@@ -280,7 +291,7 @@ Notionは「日次ページ」か「イベントDB」かで設計が変わる。
 - Notionは「日次ページ」か「DB中心」か（まずは案A、OCR全文同期はオプション）
 
 ## 15. 本スレで確定した方針（v0.2）
-- ログ保存先: プロジェクト直下の `EVERYTIME-LOG/`（互換: `EVERLOG-LOG/`）
+- ログ保存先: プロジェクト直下の `EVERYTIME-LOG/`
 - スケジューリング:
   - 定期キャプチャ: `launchd` で短命プロセスを定期起動（デフォルト5分）
   - 日次処理: `launchd` で毎日23:55に `enrich` → `summarize` を実行

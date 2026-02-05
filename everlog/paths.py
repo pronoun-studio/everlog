@@ -2,11 +2,12 @@
 # How: 実行時にhomeディレクトリを基準にパスを組み立て、初回実行でも破綻しないように `mkdir(exist_ok=True)` で作成する。
 # Key functions: `get_paths()`, `ensure_dirs()`, `AppPaths`
 # Collaboration: capture/summarize/ocr/menubar/config などが同じ保存先規約を使うために参照する（パスの分散を防ぐ）。
-# Note: 互換性のため、旧ディレクトリ `EVERYTIME-LOG/` も自動検出/利用する。
+# Note: ログ保存先はプロジェクト直下の `EVERYTIME-LOG/` に固定する
 from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import os
 
 
 @dataclass(frozen=True)
@@ -16,58 +17,107 @@ class AppPaths:
     out_dir: Path
     tmp_dir: Path
     bin_dir: Path
+    trace_dir: Path
     config_path: Path
 
 
-def _find_project_log_dir() -> Path | None:
-    """開発時にプロジェクト直下のログディレクトリを探す。"""
-    # まずは実行時のカレントディレクトリ直下を優先（最も分かりやすい）
-    for dirname in ("EVERLOG-LOG", "EVERYTIME-LOG"):
-        cwd_candidate = Path.cwd() / dirname
-        if cwd_candidate.is_dir():
-            return cwd_candidate
-    # このファイルの位置から上位に遡って探索（app bundle内でも見つけるため）
-    for parent in Path(__file__).resolve().parents:
-        for dirname in ("EVERLOG-LOG", "EVERYTIME-LOG"):
-            candidate = parent / dirname
-            if candidate.is_dir():
-                return candidate
-    return None
+def _project_root_with_marker() -> tuple[Path, bool]:
+    """
+    プロジェクトルート（pyproject.toml または .git を含むディレクトリ）を推定する。
+    見つからない場合は CWD を返す。
+    """
+    try:
+        here = Path(__file__).resolve()
+        for parent in here.parents:
+            if (parent / "pyproject.toml").exists() or (parent / ".git").exists():
+                return parent, True
+    except Exception:
+        pass
+    return Path.cwd(), False
 
 
-def _find_known_dev_log_dir() -> Path | None:
-    """既知の開発用ディレクトリ配下からログディレクトリを探す。"""
-    home = Path.home()
-    for base in (home / "DEV", home / "dev"):
-        for repo in ("everytimecapture", "everlog"):
-            for dirname in ("EVERLOG-LOG", "EVERYTIME-LOG"):
-                candidate = base / repo / dirname
-                if candidate.is_dir():
-                    return candidate
-    return None
+def _project_root() -> Path:
+    return _project_root_with_marker()[0]
+
+
+def _log_home_pref_path() -> Path:
+    return Path.home() / ".everlog" / "log_home.txt"
+
+
+def _read_log_home_pref() -> Path | None:
+    try:
+        path = _log_home_pref_path()
+        if not path.exists():
+            return None
+        val = path.read_text(encoding="utf-8").strip()
+        if not val:
+            return None
+        pref = Path(val).expanduser()
+        return pref if pref.exists() else None
+    except Exception:
+        return None
+
+
+def _write_log_home_pref(home: Path) -> None:
+    try:
+        pref = _log_home_pref_path()
+        pref.parent.mkdir(parents=True, exist_ok=True)
+        pref.write_text(str(home), encoding="utf-8")
+    except Exception:
+        pass
+
+
+def _log_home_override() -> Path | None:
+    val = (
+        os.environ.get("EVERLOG_LOG_HOME")
+        or os.environ.get("EVERYTIMECAPTURE_LOG_HOME")
+        or ""
+    ).strip()
+    if not val:
+        return None
+    return Path(val).expanduser()
 
 
 def get_paths() -> AppPaths:
-    # 優先順位: 1) プロジェクト直下 2) 既知の開発パス
-    project_log = _find_project_log_dir()
-    if project_log:
-        home = project_log
-    else:
-        dev_log = _find_known_dev_log_dir()
-        if dev_log:
-            home = dev_log
-        else:
-            raise RuntimeError(
-                "ログ保存先が見つかりません。"
-                "プロジェクト直下に `EVERYTIME-LOG/`（または `EVERLOG-LOG/`）を作成するか、"
-                "リポジトリ内から実行してください。"
-            )
+    override = _log_home_override()
+    if override:
+        home = override
+        _write_log_home_pref(home)
+        return AppPaths(
+            home=home,
+            logs_dir=home / "logs",
+            out_dir=home / "out",
+            tmp_dir=home / "tmp",
+            bin_dir=home / "bin",
+            trace_dir=home / "trace",
+            config_path=home / "config.json",
+        )
+
+    pref = _read_log_home_pref()
+    if pref:
+        home = pref
+        return AppPaths(
+            home=home,
+            logs_dir=home / "logs",
+            out_dir=home / "out",
+            tmp_dir=home / "tmp",
+            bin_dir=home / "bin",
+            trace_dir=home / "trace",
+            config_path=home / "config.json",
+        )
+
+    # デフォルトは常にプロジェクト直下の `EVERYTIME-LOG/` に固定する
+    root, found = _project_root_with_marker()
+    home = root / "EVERYTIME-LOG"
+    if found:
+        _write_log_home_pref(home)
     return AppPaths(
         home=home,
         logs_dir=home / "logs",
         out_dir=home / "out",
         tmp_dir=home / "tmp",
         bin_dir=home / "bin",
+        trace_dir=home / "trace",
         config_path=home / "config.json",
     )
 
@@ -79,4 +129,5 @@ def ensure_dirs() -> AppPaths:
     paths.out_dir.mkdir(parents=True, exist_ok=True)
     paths.tmp_dir.mkdir(parents=True, exist_ok=True)
     paths.bin_dir.mkdir(parents=True, exist_ok=True)
+    paths.trace_dir.mkdir(parents=True, exist_ok=True)
     return paths

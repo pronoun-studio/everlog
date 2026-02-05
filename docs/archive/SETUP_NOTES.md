@@ -14,7 +14,7 @@
 
 | 項目 | 状態 | 備考 |
 |------|------|------|
-| Phase 0: 保存先統一 | ✅ 完了 | `EVERLOG-LOG/` を使用（互換: `EVERYTIME-LOG/`） |
+| Phase 0: 保存先統一 | ✅ 完了 | プロジェクト直下の `EVERYTIME-LOG/` を使用 |
 | Phase 1: Automation権限 | ✅ 完了 | AppleScript正常動作 |
 | Phase 1: Screen Recording権限 | ✅ 完了 | `python3` を追加済み |
 | Phase 1: launchd capture | ✅ 動作中 | 定期実行登録済み |
@@ -40,14 +40,13 @@ request.recognitionLanguages = ["ja-JP", "en-US"]  // 追加
 **重要**: ソース修正後は必ず再ビルド＆配置が必要：
 ```bash
 cd ocr/ecocr && swift build -c release
-cp .build/release/ecocr ~/DEV/everytimecapture/EVERLOG-LOG/bin/ecocr
+cp .build/release/ecocr ~/DEV/everytimecapture/EVERYTIME-LOG/bin/ecocr
 ```
 
 ---
 
 ## 0. 保存先の統一（Phase 0）✅ 完了
-- プロジェクト直下の `EVERLOG-LOG/` を正として使う（互換: `EVERYTIME-LOG/` も自動検出）
-- `EVERLOG-LOG/` があれば自動でそちらが使われる
+- プロジェクト直下の `EVERYTIME-LOG/` を正として使う
 
 ## 1. 権限の付与（Phase 1）✅ 完了
 
@@ -129,7 +128,7 @@ python setup.py py2app
 ### launchdが `.app` 経由で capture を実行するようにする
 次のどちらかで指定:
 - 環境変数 `EVERLOG_CAPTURE_APP`（互換: `EVERYTIMECAPTURE_CAPTURE_APP`）
-- `EVERLOG-LOG/config.json` の `capture_app_path`（互換: `EVERYTIME-LOG/config.json`）
+- `EVERYTIME-LOG/config.json` の `capture_app_path`
 
 例:
 ```sh
@@ -144,8 +143,8 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 ```
 
 確認ポイント:
-- `EVERLOG-LOG/tmp/` にスクショが残る（いまは `keep_screenshots=true`）
-- `EVERLOG-LOG/logs/YYYY-MM-DD.jsonl` の `error` が激減している
+- `EVERYTIME-LOG/tmp/` にスクショが残る（いまは `keep_screenshots=true`）
+- `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl` の `error` が激減している
 - `window_title` と `ocr_text` が空ではない行が増えている
 
 ---
@@ -173,8 +172,8 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 **デフォルトモデル**: `gpt-5-nano`（環境変数 `EVERLOG_LLM_MODEL`（互換: `EVERYTIMECAPTURE_LLM_MODEL`）で変更可）
 
 出力:
-- LLM結果: `EVERLOG-LOG/out/YYYY-MM-DD.llm.json`
-- Markdown: `EVERLOG-LOG/out/YYYY-MM-DD.md`
+- LLM結果: `EVERYTIME-LOG/out/YYYY-MM-DD.llm.json`
+- Markdown: `EVERYTIME-LOG/out/YYYY-MM-DD.md`
 
 LLM出力に期待する内容:
 - `task_title`（短い作業名）

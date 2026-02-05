@@ -102,9 +102,16 @@ def _build_user_prompt(date: str, segments: list[dict[str, Any]]) -> str:
     payload = json.dumps({"date": date, "segments": segments}, ensure_ascii=False, indent=2)
     return (
         "あなたはPC作業ログの解析者です。以下のセグメント一覧から、各セグメントに"
-        "「task_title」「task_summary」「category」「confidence」を付与してください。"
-        "必ずJSONのみを返してください。要約は日本語で1〜2文、推測は控えめに。"
-        "category は [dev, meeting, research, writing, admin, other] から選ぶ。\n\n"
+        "「task_title」「task_summary」「category」「confidence」を付与してください。\n"
+        "\n"
+        "重要: 具体性を最優先にしてください。入力には `keywords` / `ocr_snippets` / `domain` / `window_title` が含まれます。\n"
+        "- `task_title` は短く具体的（例:「OpenAIのAPI keys画面を確認」「everlog.appをターミナルから起動してログ確認」「GitHubでpronoun-studio/parameter-coinを閲覧」）。\n"
+        "- `task_summary` は日本語1〜2文。必ず「何を」見た/操作したかを、ファイル名・ディレクトリ・URL・画面名など具体的なアンカーで最低1つ入れる。\n"
+        "- 「データ探索」「情報参照」「短時間作業」「ファイル確認」だけの抽象表現で終わらせない（具体アンカー無しは禁止）。\n"
+        "- 推測は控えめに（根拠が `keywords` / `ocr_snippets` / `window_title` にある範囲で）。\n"
+        "- 秘密情報は出さない: APIキーやトークン文字列（`sk-...` など）/メール/パスワードらしきものは伏せる。既に `[REDACTED_*]` があればそれを尊重。\n"
+        "\n"
+        "必ずJSONのみを返してください。category は [dev, meeting, research, writing, admin, other] から選ぶ。\n\n"
         "出力JSONの形式:\n"
         "{\n"
         '  "segments": [\n'
@@ -215,6 +222,14 @@ def _load_dotenv_if_needed() -> None:
             p = part.strip()
             if p:
                 candidates.append(Path(p).expanduser())
+
+    log_home_override = (
+        os.environ.get("EVERLOG_LOG_HOME")
+        or os.environ.get("EVERYTIMECAPTURE_LOG_HOME")
+        or ""
+    ).strip()
+    if log_home_override:
+        candidates.append(Path(log_home_override).expanduser() / ".env")
 
     # 1) current working directory
     candidates.append(Path.cwd() / ".env")
