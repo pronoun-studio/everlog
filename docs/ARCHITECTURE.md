@@ -103,6 +103,7 @@ graph TD
 - `EVERYTIME-LOG/tmp/`（一時スクショ。デフォルトで削除）
 - `EVERYTIME-LOG/config.json`（設定）
 - `EVERYTIME-LOG/bin/ecocr`（Vision OCRヘルパー。Swiftでビルドして配置）
+- `EVERYTIME-LOG/bin/ecdisplay`（アクティブディスプレイ推定ヘルパー。Swiftでビルドして配置）
 - `~/.everlog/*.log`（launchdの標準出力/エラー出力）
 
 ## 3. ルート直下のファイル
@@ -168,6 +169,14 @@ graph TD
 - 連携:
   - `everlog/capture.py` がスクショの一時ファイルを渡してOCR結果を受け取る。
   - 実体は `EVERYTIME-LOG/bin/ecocr`（または環境変数指定）で、Swift側実装は `ocr/ecocr/` にある。
+
+### `everlog/display.py`
+- 役割: アクティブディスプレイ番号の推定（外部バイナリ `ecdisplay` を呼ぶ）
+  - 「前面ウィンドウが載っているディスプレイ」を推定し、`screencapture -D` の番号（1始まり）として使える形で返す。
+  - 失敗時は None を返し、キャプチャ全体は継続できるようにする。
+- 連携:
+  - `everlog/capture.py` が結果を JSONL の `active_display` / `ocr_active_display_text` などとして記録する。
+  - 実体は `EVERYTIME-LOG/bin/ecdisplay`（または環境変数指定）で、Swift側実装は `ocr/ecocr/` にある。
 
 ### `everlog/exclusions.py`
 - 役割: 除外判定（アプリ/ドメイン/キーワード）

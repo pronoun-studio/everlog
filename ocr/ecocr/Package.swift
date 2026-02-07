@@ -11,12 +11,17 @@ let package = Package(
         .macOS(.v13)
     ],
     products: [
-        .executable(name: "ecocr", targets: ["ecocr"])
+        .executable(name: "ecocr", targets: ["ecocr"]),
+        .executable(name: "ecdisplay", targets: ["ecdisplay"]),
     ],
     targets: [
         .executableTarget(
             name: "ecocr",
             path: "Sources"
+        ),
+        .executableTarget(
+            name: "ecdisplay",
+            path: "SourcesECDisplay"
         )
     ]
 )

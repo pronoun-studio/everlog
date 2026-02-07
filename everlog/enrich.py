@@ -11,7 +11,7 @@ import json
 import os
 
 from .jsonl import read_jsonl
-from .llm import analyze_segments
+from .llm import analyze_segments, calc_cost_usd
 from .paths import ensure_dirs, get_paths
 from .segments import build_segments
 from .timeutil import normalize_date_arg
@@ -87,6 +87,8 @@ def enrich_day_with_llm(
         "generated_at": datetime.now().astimezone().isoformat(),
         "segment_count": len(seg_dicts),
         "truncated": truncated,
+        "usage": llm_result.usage,
+        "cost_usd": calc_cost_usd(llm_result.usage, llm_result.model),
         "segments": merged,
     }
     out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")

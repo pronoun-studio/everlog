@@ -254,6 +254,7 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 - `EVERLOG_CAPTURE_APP`: 画面収録権限を付与した `.app` のパス（互換: `EVERYTIMECAPTURE_CAPTURE_APP`）
 - `OPENAI_API_KEY`: LLM要約（`enrich`）に必要
 - `EVERLOG_LLM_MODEL`: LLMモデル名（default `gpt-5-nano`、互換: `EVERYTIMECAPTURE_LLM_MODEL`）
+- `EVERLOG_SAFE_MARKDOWN`: 最終Markdown/Notion同期のタイトルで、PII・認証情報・典型的なトークン等をローカルでマスクする（default: 有効）。無効化する場合は `0` を指定（互換: `EVERYTIMECAPTURE_SAFE_MARKDOWN`）
 
 ## 詳細ドキュメント
 - `DESIGN.md`: 設計仕様（要件・データ形式・実行形態・プライバシー方針）

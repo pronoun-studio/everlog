@@ -19,12 +19,21 @@ def read_jsonl(path: Path) -> list[dict[str, Any]]:
     if not path.exists():
         return []
     out: list[dict[str, Any]] = []
-    for line in path.read_text(encoding="utf-8").splitlines():
-        line = line.strip()
+    for line in path.read_text(encoding="utf-8", errors="replace").splitlines():
+        line = (line or "").strip()
         if not line:
             continue
         try:
             out.append(json.loads(line))
         except json.JSONDecodeError:
+            # Some logs may be polluted by prefixes like `14:33:0{...}` (e.g. stray stdout).
+            # Try salvaging by parsing from the first JSON object start.
+            idx = line.find("{")
+            if idx > 0:
+                try:
+                    out.append(json.loads(line[idx:]))
+                    continue
+                except json.JSONDecodeError:
+                    pass
             continue
     return out

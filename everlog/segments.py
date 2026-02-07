@@ -116,21 +116,22 @@ def _extract_posix_paths(text: str) -> list[str]:
     return filtered
 
 
-def extract_event_features(text: str) -> dict[str, Any]:
+def extract_event_features(
+    text: str,
+    *,
+    keyword_limit: int = 8,
+    snippet_limit: int = 3,
+    snippet_max_len: int = 120,
+) -> dict[str, Any]:
     """
     Event-level features derived from OCR text.
     """
     normalized = _normalize_for_entities(text)
     urls = _extract_url_like(normalized)
     paths = _extract_posix_paths(text)
-    keywords = _extract_keywords(text)
-    snippets = _extract_snippets(text)
     return {
-        "normalized_text": normalized,
         "urls": urls,
         "paths": paths,
-        "keywords": keywords,
-        "snippets": snippets,
     }
 
 
@@ -245,20 +246,127 @@ def _title_from_event(e: dict[str, Any]) -> str:
     return str(e.get("window_title") or "").strip()
 
 
-def _event_ocr_text(e: dict[str, Any]) -> str:
+def _event_display_texts(e: dict[str, Any]) -> tuple[str, str, bool]:
+    """
+    Return (primary_text, reference_text) based on active display first.
+    - primary_text: active display OCR if available and not excluded.
+    - reference_text: OCR from other non-excluded displays.
+    Fallbacks:
+    - If no active display OCR, primary_text falls back to all non-excluded displays.
+    - If no ocr_by_display, falls back to legacy ocr_text.
+    """
+    active_display = e.get("active_display")
+    active_display_text = str(e.get("ocr_active_display_text") or "")
+    active_display_excluded = e.get("ocr_active_display_excluded")
+
     ocr_by_display = e.get("ocr_by_display") or []
+    active_text = ""
+    other_texts: list[str] = []
     if isinstance(ocr_by_display, list) and ocr_by_display:
-        texts: list[str] = []
         for item in ocr_by_display:
             if not isinstance(item, dict):
                 continue
             if item.get("excluded", False):
                 continue
             t = str(item.get("ocr_text") or "")
-            if t:
-                texts.append(t)
-        return "\n\n".join(texts)
-    return str(e.get("ocr_text") or "")
+            if not t:
+                continue
+            try:
+                d = int(item.get("display", 0) or 0)
+            except Exception:
+                d = 0
+            if active_display is not None and d == int(active_display):
+                active_text = t
+            else:
+                other_texts.append(t)
+
+    # Prefer explicit active display OCR if not excluded.
+    used_active_display = False
+    if active_display_text and active_display_excluded is False:
+        primary_text = active_display_text
+        used_active_display = True
+    elif active_text and active_display_excluded is not True:
+        primary_text = active_text
+        used_active_display = True
+    else:
+        # fallback: all non-excluded display texts
+        primary_text = "\n\n".join(other_texts).strip()
+
+    reference_text = "\n\n".join(other_texts).strip()
+    if not primary_text:
+        # legacy fallback
+        legacy = str(e.get("ocr_text") or "").strip()
+        if legacy:
+            primary_text = legacy
+            reference_text = ""
+
+    return primary_text, reference_text, used_active_display
+
+
+def _event_display_entries(e: dict[str, Any]) -> list[dict[str, Any]]:
+    """
+    Return per-display OCR entries with normalized text.
+    Each entry contains display number, normalized ocr_text, and active display flag.
+    """
+    active_display_raw = e.get("active_display")
+    try:
+        active_display = int(active_display_raw)
+    except Exception:
+        active_display = None
+
+    entries: list[dict[str, Any]] = []
+    ocr_by_display = e.get("ocr_by_display") or []
+    if isinstance(ocr_by_display, list):
+        for item in ocr_by_display:
+            if not isinstance(item, dict):
+                continue
+            display_raw = item.get("display")
+            try:
+                display_num = int(display_raw)
+                display_out: Any = display_num
+            except Exception:
+                display_num = None
+                display_out = display_raw
+
+            text = str(item.get("ocr_text") or "")
+            normalized = _normalize_for_entities(text)
+            if display_out is None and not normalized:
+                continue
+            is_active = bool(display_num is not None and active_display is not None and display_num == active_display)
+            entries.append(
+                {
+                    "display": display_out,
+                    "ocr_text": normalized,
+                    "is_active_display": is_active,
+                }
+            )
+    return entries
+
+
+def _event_primary_source(
+    e: dict[str, Any],
+    primary_text: str,
+    reference_text: str,
+    used_active_display: bool,
+) -> str:
+    """
+    Returns one of: active_display | fallback_all_displays | fallback_empty
+    """
+    if primary_text:
+        if used_active_display:
+            return "active_display"
+        if reference_text:
+            return "fallback_all_displays"
+        legacy = str(e.get("ocr_text") or "").strip()
+        if legacy:
+            return "fallback_all_displays"
+    return "fallback_empty"
+
+
+def _event_ocr_text(e: dict[str, Any]) -> str:
+    # Backward-compatible helper: primary text only.
+    primary_text, _reference_text, _used_active = _event_display_texts(e)
+    return primary_text
 
 
 def _shorten(s: str, max_len: int = 80) -> str:
@@ -396,9 +504,10 @@ def build_segments(events: list[dict[str, Any]], default_interval_sec: int) -> l
         dom = _domain_from_event(e).strip()
         title = _shorten(_title_from_event(e), max_len=80)
         label = _label_from_event(e)
-        ocr_text = _event_ocr_text(e)
-        kws = _extract_keywords(ocr_text)
-        snips = _extract_snippets(ocr_text)
+        primary_text, _reference_text, _used_active = _event_display_texts(e)
+        feats = extract_event_features(primary_text)
+        kws = feats.get("keywords") or []
+        snips = feats.get("snippets") or []
 
         key = (app, dom, title or "")
 
@@ -491,8 +600,10 @@ def build_segments_with_event_trace(
         dom = _domain_from_event(e).strip()
         title = _shorten(_title_from_event(e), max_len=80)
         label = _label_from_event(e)
-        ocr_text = _event_ocr_text(e)
-        feats = extract_event_features(ocr_text)
+        primary_text, reference_text, used_active = _event_display_texts(e)
+        feats = extract_event_features(primary_text)
+        primary_source = _event_primary_source(e, primary_text, reference_text, used_active)
+        display_entries = _event_display_entries(e)
 
         key = (app, dom, title or "")
 
@@ -536,6 +647,8 @@ def build_segments_with_event_trace(
                 "window_title": str(e.get("window_title") or ""),
                 "domain": dom,
                 "segment_key": key,
+                "primary_source": primary_source,
+                "ocr_by_display": display_entries,
                 **feats,
             }
         )

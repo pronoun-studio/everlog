@@ -62,10 +62,12 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
 3. 全ディスプレイを `screencapture` で一時ファイルに保存（1ディスプレイ=1枚）
 4. ディスプレイごとにVision OCRでテキスト抽出
 5. ディスプレイごとに除外判定/マスキングし、`ocr_by_display` に記録 → JSONLに追記
+   - 追加で `active_display` と `ocr_active_display_text` を記録し、要約/タイムライン生成ではこれを主入力として扱う（主役=アクティブ画面）
 6. 一時画像を削除（デフォルト）
 7. 日次で `enrich`（任意）→ `summarize` を実行し、Markdownを生成
    - `enrich`: OpenAI APIでセグメントに作業名/要約を付与（`out/YYYY-MM-DD.llm.json`）
    - `summarize`: JSONLとLLM結果からMarkdownを生成
+   - パイプライン詳細（Active Display First / 1時間タイムライン案）: `docs/PIPELINE.md`
 
 ### 5.2 主要コンポーネント（実装済み）
 - `collect.py`
@@ -147,6 +149,12 @@ Collaboration: 実装詳細は ARCHITECTURE.md と各ソースファイル先頭
   - `name` (string): `Arc|Chrome|Safari|...`
   - `url` (string): アクティブタブURL
   - `domain` (string): `example.com`
+- `active_display` (number): 「アクティブなディスプレイ番号（1始まり）」の推定値（`ocr_by_display[].display` と対応）
+- `active_display_source` (string): 推定方法（例: `front_window_center|mouse|missing|error`）
+- `active_display_error` (string): 推定失敗時のエラー（取得できないことがある）
+- `ocr_active_display_text` (string): `active_display` に対応するディスプレイのOCRテキスト（除外時/不明時は空）
+- `ocr_active_display_excluded` (boolean|null): `active_display` のOCRが除外されたか（不明ならnull）
+- `ocr_active_display_excluded_reason` (string|null): 除外理由（不明/未除外ならnull）
 - `ocr_text` (string): 旧形式の互換用（必要なら `ocr_by_display` から導出）。空文字のことがある。
 - `screen` (object):
   - `width` (number)

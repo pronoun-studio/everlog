@@ -16,6 +16,7 @@ import subprocess
 
 from .collect import collect_active_context
 from .config import load_config
+from .display import get_active_display_info
 from .exclusions import should_exclude
 from .jsonl import append_jsonl
 from .ocr import run_local_ocr
@@ -56,11 +57,17 @@ def _runner_info() -> dict[str, Any]:
     except Exception:
         exe_resolved = str(exe)
 
+    try:
+        cwd = os.getcwd()
+    except Exception:
+        # Under launchd, the working directory may disappear; never fail capture/error reporting for this.
+        cwd = ""
+
     return {
         "python": str(exe),
         "python_resolved": exe_resolved,
         "argv": sys.argv,
-        "cwd": os.getcwd(),
+        "cwd": cwd,
         "pid": os.getpid(),
         "ppid": os.getppid(),
         "uid": os.getuid(),
@@ -172,15 +179,15 @@ def _read_pmset_assertions() -> dict[str, int] | None:
 
 
 def _parse_pmset_log_event(line: str) -> tuple[datetime, str, str] | None:
+    # `pmset -g log` contains lines like "Wake Requests" which are not power state changes.
+    # Only treat rows where the event field is followed by whitespace and then a tab.
     match = re.match(
-        r"^(?P<ts>\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}) (?P<tz>[+-]\\d{4})\\s+(?P<event>\\w+)",
+        r"^(?P<ts>\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}) (?P<tz>[+-]\d{4})\s+(?P<event>Sleep|DarkWake|Wake) +\t",
         line,
     )
     if not match:
         return None
     event = match.group("event")
-    if event not in {"Sleep", "DarkWake", "Wake"}:
-        return None
     try:
         dt = datetime.strptime(
             f"{match.group('ts')} {match.group('tz')}",
@@ -217,23 +224,10 @@ def _read_pmset_recent_power_event(max_lines: int = 400) -> tuple[datetime, str,
 
 
 def _should_skip_capture_due_to_sleep() -> tuple[bool, dict[str, Any] | None]:
-    stats = _read_pmset_assertions()
-    if stats:
-        user_active = stats.get("UserIsActive")
-        prevent_idle_sleep = stats.get("PreventUserIdleSystemSleep")
-        prevent_idle_display = stats.get("PreventUserIdleDisplaySleep")
-        if (
-            user_active == 0
-            and prevent_idle_sleep == 0
-            and (prevent_idle_display in (None, 0))
-        ):
-            return True, {
-                "source": "pmset",
-                "user_active": user_active,
-                "prevent_idle_sleep": prevent_idle_sleep,
-                "prevent_idle_display": prevent_idle_display,
-            }
-
+    # Use pmset log (Sleep/DarkWake) as the primary signal.
+    # NOTE: `pmset -g assertions`'s UserIsActive can be 0 even while the user is active
+    # (observed in real usage), which caused long capture gaps. So we no longer skip
+    # purely based on assertions.
     recent = _read_pmset_recent_power_event()
     if recent:
         event_dt, event_name, raw = recent
@@ -246,6 +240,7 @@ def _should_skip_capture_due_to_sleep() -> tuple[bool, dict[str, Any] | None]:
                 "line": raw,
             }
 
+    stats = _read_pmset_assertions()
     return False, stats
 
 
@@ -264,6 +259,7 @@ def run_capture_once(force: bool = False) -> None:
             return
 
     ctx = collect_active_context(cfg)
+    active_display = get_active_display_info()
     browser_obj = None if not ctx.browser else {"name": ctx.browser.name, "url": ctx.browser.url, "domain": ctx.browser.domain}
     active_context = {
         "app": ctx.active_app,
@@ -291,6 +287,9 @@ def run_capture_once(force: bool = False) -> None:
                 "window_title": "[REDACTED]",
                 "browser": browser_redacted,
                 "active_context": active_context_redacted,
+                "active_display": active_display.display,
+                "active_display_source": active_display.source,
+                "active_display_error": active_display.error,
                 # Keep schema stable: `ocr_text` is always present (empty when skipped).
                 "ocr_text": "",
                 "ocr_by_display": [],
@@ -342,6 +341,23 @@ def run_capture_once(force: bool = False) -> None:
             ocr_by_display.append(entry)
 
         all_excluded = bool(ocr_by_display) and all(e.get("excluded", False) for e in ocr_by_display)
+        active_display_text = ""
+        active_display_excluded: bool | None = None
+        active_display_excluded_reason: str | None = None
+        if active_display.display is not None:
+            for item in ocr_by_display:
+                try:
+                    if int(item.get("display", 0)) != int(active_display.display):
+                        continue
+                except Exception:
+                    continue
+                active_display_excluded = bool(item.get("excluded", False))
+                if active_display_excluded:
+                    active_display_excluded_reason = str(item.get("excluded_reason") or "") or None
+                    active_display_text = ""
+                else:
+                    active_display_text = str(item.get("ocr_text") or "")
+                break
         event: dict[str, Any] = {
             "id": event_id,
             "ts": ts,
@@ -351,8 +367,14 @@ def run_capture_once(force: bool = False) -> None:
             "window_title": ctx.window_title,
             "browser": browser_obj,
             "active_context": active_context,
+            "active_display": active_display.display,
+            "active_display_source": active_display.source,
+            "active_display_error": active_display.error,
             # ocr_text is kept for backward compatibility; prefer ocr_by_display.
             "ocr_text": "",
+            "ocr_active_display_text": active_display_text,
+            "ocr_active_display_excluded": active_display_excluded,
+            "ocr_active_display_excluded_reason": active_display_excluded_reason,
             "ocr_by_display": ocr_by_display,
             "excluded": all_excluded,
         }
@@ -393,8 +415,14 @@ def run_capture_once(force: bool = False) -> None:
                 "window_title": ctx.window_title,
                 "browser": browser_obj,
                 "active_context": active_context,
+                "active_display": active_display.display,
+                "active_display_source": active_display.source,
+                "active_display_error": active_display.error,
                 "excluded": False,
                 "ocr_text": "",
+                "ocr_active_display_text": "",
+                "ocr_active_display_excluded": None,
+                "ocr_active_display_excluded_reason": None,
                 "ocr_by_display": [],
                 "error": error,
                 "runner": runner,

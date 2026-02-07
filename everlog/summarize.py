@@ -13,9 +13,11 @@ import os
 import re
 
 from .jsonl import read_jsonl
+from .config import load_config
 from .paths import ensure_dirs, get_paths
 from .segments import build_segments, build_segments_with_event_trace
 from .llm import LlmError, analyze_day_summary, analyze_hour_blocks, calc_cost_usd
+from .safety import sanitize_markdown_for_sharing, sanitize_text_for_sharing
 from .timeutil import make_run_id, normalize_date_arg
 
 
@@ -1135,6 +1137,19 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     p = get_paths()
     log_path = p.logs_dir / f"{date}.jsonl"
 
+    cfg = load_config()
+    safe_md_raw = str(
+        os.environ.get("EVERLOG_SAFE_MARKDOWN")
+        or os.environ.get("EVERYTIMECAPTURE_SAFE_MARKDOWN")
+        or ""
+    ).strip()
+    safe_md_enabled = safe_md_raw not in {"0", "false", "FALSE", "no", "NO"}
+
+    def _safe(s: str) -> str:
+        if not safe_md_enabled:
+            return s
+        return sanitize_text_for_sharing(s, cfg)
+
     trace_enabled = str(
         os.environ.get("EVERLOG_TRACE") or os.environ.get("EVERYTIMECAPTURE_TRACE") or ""
     ).strip() in {"1", "true", "TRUE", "yes", "YES"}
@@ -1264,6 +1279,14 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     # hour-enrich LLM: daily contextを踏まえて各時間帯の目的・意味を再解釈
     hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
     hour_enrich_llm_meta: dict[str, Any] = {}
+    # If cache exists, load meta (usage/model) too so the markdown "LLM使用量" shows correct status.
+    if _hour_enrich_llm_enabled() and hour_enrich_llm_map:
+        try:
+            meta = _load_hour_enrich_llm(date, run_id=output_run_id)
+            if isinstance(meta, dict):
+                hour_enrich_llm_meta = meta
+        except Exception:
+            hour_enrich_llm_meta = {}
     if _hour_enrich_llm_enabled() and not hour_enrich_llm_map and daily_llm and hourly_llm_map:
         hour_enrich_out = _maybe_run_hour_enrich_llm(
             date,
@@ -1316,6 +1339,8 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
         if isinstance(daily_for_title, dict)
         else ""
     )
+    if daily_title_for_header:
+        daily_title_for_header = " ".join(_safe(daily_title_for_header).split())
     short_date = date[2:]  # "2026-02-07" → "26-02-07"
     title_for_filename = daily_title_for_header or "作業ログ"
     out_name = _md_output_name(date, title_for_filename, out_suffix)
@@ -1431,9 +1456,13 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     lines.append("")
     daily = daily_llm.get("daily") if isinstance(daily_llm, dict) else None
     if isinstance(daily, dict) and any(str(daily.get(k) or "").strip() for k in ("daily_title", "daily_summary")):
-        daily_title = str(daily.get("daily_title") or "").strip()
-        daily_summary = str(daily.get("daily_summary") or "").strip()
-        highlights = [str(s or "").strip() for s in (daily.get("highlights") or []) if str(s or "").strip()]
+        daily_title = _safe(str(daily.get("daily_title") or "").strip())
+        daily_summary = _safe(str(daily.get("daily_summary") or "").strip())
+        highlights = [
+            _safe(str(s or "").strip())
+            for s in (daily.get("highlights") or [])
+            if str(s or "").strip()
+        ]
         if daily_title:
             lines.append(f"- 推定: {daily_title}")
         if daily_summary:
@@ -1491,8 +1520,8 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
             shown = 0
             for s in segs_sorted:
                 llm = llm_map.get(s.segment_id, {})
-                title = str(llm.get("task_title") or "").strip()
-                summ = str(llm.get("task_summary") or "").strip()
+                title = _safe(str(llm.get("task_title") or "").strip())
+                summ = _safe(str(llm.get("task_summary") or "").strip())
                 if not title and not summ:
                     continue
                 mins = int(s.duration_sec) // 60
@@ -1500,6 +1529,7 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
                     lines.append(f"- {title}（約{mins}分）— {summ}")
                 elif title:
                     hint = _evidence_hint(s.keywords, s.ocr_snippets, limit=2)
+                    hint = _safe(hint) if hint else hint
                     lines.append(f"- {title}（約{mins}分）" + (f"（例: {hint}）" if hint else ""))
                 else:
                     lines.append(f"- {s.label}（約{mins}分）— {summ}")
@@ -1553,10 +1583,10 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
             cluster_labels = _hour_pack_cluster_labels(h)
             
             # 観測ベースの hour_title / hour_summary を優先表示
-            hour_title = str(hour_llm.get("hour_title") or "").strip()
-            hour_summary = str(hour_llm.get("hour_summary") or "").strip()
+            hour_title = _safe(str(hour_llm.get("hour_title") or "").strip())
+            hour_summary = _safe(str(hour_llm.get("hour_summary") or "").strip())
             # enriched は補足として別項目に表示
-            hour_summary_enriched = str(hour_enrich.get("hour_summary_enriched") or "").strip()
+            hour_summary_enriched = _safe(str(hour_enrich.get("hour_summary_enriched") or "").strip())
             
             # タイトル: hour_llm > cluster_labels > 不明
             display_title = hour_title
@@ -1619,5 +1649,18 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     lines.append(f"- 除外: {len(excluded_events)}回")
     lines.append(f"- スクショ/OCR失敗: {len(error_events)}回")
 
-    out_path.write_text("\n".join(lines).rstrip() + "\n", encoding="utf-8")
+    md = "\n".join(lines).rstrip() + "\n"
+    if safe_md_enabled:
+        md = sanitize_markdown_for_sharing(md, cfg)
+    out_path.write_text(md, encoding="utf-8")
+
+    # Notion同期（環境変数で有効化）
+    from .notion_sync import notion_sync_enabled, sync_daily, retry_pending
+    if notion_sync_enabled():
+        # まず未同期があれば再試行
+        retry_pending()
+        # 今回分を同期
+        daily_llm_path = _daily_llm_path(date, run_id=output_run_id)
+        sync_daily(date, output_run_id, out_path, daily_llm_path)
+
     return out_path
