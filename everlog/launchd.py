@@ -148,14 +148,15 @@ def _write_plist_capture(interval_sec: int) -> None:
 
 
 def _write_plist_daily() -> None:
-    """毎日23:55に enrich + summarize を実行するplistを生成"""
+    """毎日23:55に summarize を実行するplistを生成（enrichは任意）"""
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     plist = _plist_path(DAILY_LABEL)
     cfg = load_config()
-    # シェルスクリプトで enrich → summarize を順次実行
     python = _python_executable()
-    script = f'{python} -m everlog.cli enrich --date today && {python} -m everlog.cli summarize --date today'
+    # Default: summarize only. To include enrich, set EVERLOG_RUN_ENRICH=1 and customize your schedule.
+    # EVERLOG_HOURLY_LLM と EVERLOG_DAILY_LLM を有効化してフル機能のMarkdown生成を行う
+    script = f'EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 {python} -m everlog.cli summarize --date today'
     env_xml = _env_dict_xml()
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

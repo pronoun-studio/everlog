@@ -28,6 +28,8 @@ pip install -e .
 ## OCR（ローカル）
 v0.1では「Vision OCRヘルパー（Swift製）」をログディレクトリ配下の `bin/ecocr` に置く想定です。
 （暫定で `EVERLOG_OCR_BIN`（互換: `EVERYTIMECAPTURE_OCR_BIN`）でも指定できます。）
+また、複数ディスプレイ環境で「アクティブなディスプレイ番号（`screencapture -D` の番号）」を推定するヘルパー `ecdisplay` も同じ `bin/` 配下に置けます。
+（暫定で `EVERLOG_DISPLAY_BIN`（互換: `EVERYTIMECAPTURE_DISPLAY_BIN`）でも指定できます。）
 
 ビルド例（Xcode Command Line Toolsが必要）:
 ```sh
@@ -35,6 +37,7 @@ cd ocr/ecocr
 swift build -c release
 mkdir -p EVERYTIME-LOG/bin
 cp -f .build/release/ecocr EVERYTIME-LOG/bin/ecocr
+cp -f .build/release/ecdisplay EVERYTIME-LOG/bin/ecdisplay
 ```
 
 ## 使い方
@@ -148,6 +151,37 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 - 今すぐ1回キャプチャ: 「今すぐ1回キャプチャ」
 - 今日のマークダウン生成: 「今日のマークダウン生成」
 
+## 主要な実行方法（2つ）
+マークダウン生成には主に以下の2つの方法があります:
+
+1. **メニューバーから手動実行**: `everlog.app` のメニューバーから「今日のマークダウン生成」を選択
+2. **毎日23:55に自動実行**: `launchd daily install` で設定。毎日23:55に自動でマークダウン生成
+
+いずれの場合も、出力は `EVERYTIME-LOG/out/<date>/<run_id>/` ディレクトリに格納されます。
+（`out/<date>.md` への直接出力は廃止されました）
+
+### Pythonコード変更時の再ビルド
+`everlog.app`（メニューバー）はpy2appでビルドされており、**Pythonコードがアプリ内にバンドル**されています。
+そのため、`everlog/` 配下のPythonコードを変更した場合は以下の手順が必要です:
+
+```sh
+# 1. .app を再ビルド
+cd macos_app
+python setup.py py2app --dist-dir dist
+
+# 2. 実行中のメニューバーを終了して再起動
+pkill -f "everlog.app/Contents/MacOS/everlog"
+open dist/everlog.app
+```
+
+**注**: `launchd daily`（23:55自動実行）は `.venv/bin/python` を直接呼び出すため、
+`pip install -e .` を実行すればPythonコード変更が反映されます（再ビルド不要）。
+ただし、launchdのplist設定を変更した場合は再インストールが必要です:
+```sh
+./.venv/bin/everlog launchd daily uninstall
+./.venv/bin/everlog launchd daily install
+```
+
 ### メニューバーUI仕様（表示）
 - 定期キャプチャ: 「●動作中」or「○停止中」
 - 今日のキャプチャ回数: x回
@@ -206,7 +240,10 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 
 ## 保存先
 - ログ: `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`
-- 出力: `EVERYTIME-LOG/out/YYYY-MM-DD.md`（LLM結果: `YYYY-MM-DD.llm.json`）
+- 出力: `EVERYTIME-LOG/out/YYYY-MM-DD/<run_id>/`
+  - マークダウン: `YYYY-MM-DD.md`
+  - LLM結果: `YYYY-MM-DD.hourly.llm.json`, `YYYY-MM-DD.daily.llm.json`, `YYYY-MM-DD.hour-enrich.llm.json`
+  - （任意）segment-llm結果: `YYYY-MM-DD.llm.json`
 - 一時: `EVERYTIME-LOG/tmp/`
 - バイナリ: `EVERYTIME-LOG/bin/`（OCRヘルパー `ecocr` など）
 - 設定: `EVERYTIME-LOG/config.json`

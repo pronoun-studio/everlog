@@ -14,7 +14,9 @@ from pathlib import Path
 from .config import load_config, save_config
 from .jsonl import read_jsonl
 from .launchd import capture_program_args
+from .llm import _load_dotenv_if_needed
 from .paths import get_paths
+from .timeutil import make_run_id
 
 
 def _require_rumps():
@@ -53,7 +55,19 @@ def _capture_stats() -> tuple[int, str]:
     return len(events), _format_last_ts(str(last))
 
 
+def _latest_md_in_dir(dir_path: Path) -> Path | None:
+    try:
+        items = [p for p in dir_path.glob("*.md") if p.is_file()]
+    except Exception:
+        return None
+    if not items:
+        return None
+    return max(items, key=lambda p: p.stat().st_mtime)
+
+
 def _run(cmd: list[str], *, env_override: dict[str, str] | None = None) -> None:
+    # Always load .env on menubar actions to keep env consistent.
+    _load_dotenv_if_needed()
     env = os.environ.copy()
     if env_override:
         env.update(env_override)
@@ -124,6 +138,8 @@ def _launched_by_launchd_menubar() -> bool:
 
 
 def run_menubar() -> None:
+    # Ensure .env is loaded at startup.
+    _load_dotenv_if_needed()
     rumps = _require_rumps()
     log_home = get_paths().home
     pid = os.getpid()
@@ -363,8 +379,12 @@ def run_menubar() -> None:
             rumps.notification("everlog", "生成開始", "今日のマークダウンを生成中...")
             trace_env = os.environ.copy()
             trace_env["EVERLOG_TRACE"] = "1"
-            trace_env["EVERLOG_TRACE_RUN_ID"] = datetime.now().astimezone().strftime("%H%M%S-%f")
+            trace_env["EVERLOG_TRACE_RUN_ID"] = make_run_id()
             trace_env["EVERLOG_OUTPUT_RUN_ID"] = trace_env["EVERLOG_TRACE_RUN_ID"]
+            # Hourly LLM is required for "complete" timeline output.
+            trace_env["EVERLOG_HOURLY_LLM"] = "1"
+            # Daily LLM summary (uses hour summaries, low incremental cost).
+            trace_env["EVERLOG_DAILY_LLM"] = "1"
             try:
                 run_id = trace_env["EVERLOG_TRACE_RUN_ID"]
                 run_dir = get_paths().trace_dir / _today() / run_id
@@ -383,21 +403,30 @@ def run_menubar() -> None:
                 )
             except Exception as e:
                 _debug(f"trace_run_dir: failed: {e}")
-            # enrich (LLM解析) → summarize (Markdown生成) を順次実行
-            # enrichが失敗してもsummarizeは実行する（LLMなしでもMarkdownは生成可能）
-            enrich_result = subprocess.run(
-                [sys.executable, "-m", "everlog.cli", "enrich", "--date", "today"],
-                env=trace_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=False,
-            )
-            enrich_failed = enrich_result.returncode != 0
-            if enrich_failed:
-                # LLM解析失敗時は警告を出すが、summarizeは続行
-                err_msg = enrich_result.stderr.strip().split("\n")[-1] if enrich_result.stderr else "不明なエラー"
-                rumps.notification("everlog", "LLM解析スキップ", f"LLM解析に失敗: {err_msg[:50]}")
+            # enrich (segment-llm) is optional and disabled by default.
+            run_enrich = str(trace_env.get("EVERLOG_RUN_ENRICH") or "").strip() in {
+                "1",
+                "true",
+                "TRUE",
+                "yes",
+                "YES",
+            }
+            enrich_failed = False
+            if run_enrich:
+                # enrichが失敗してもsummarizeは実行する（LLMなしでもMarkdownは生成可能）
+                enrich_result = subprocess.run(
+                    [sys.executable, "-m", "everlog.cli", "enrich", "--date", "today"],
+                    env=trace_env,
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    check=False,
+                )
+                enrich_failed = enrich_result.returncode != 0
+                if enrich_failed:
+                    # LLM解析失敗時は警告を出すが、summarizeは続行
+                    err_msg = enrich_result.stderr.strip().split("\n")[-1] if enrich_result.stderr else "不明なエラー"
+                    rumps.notification("everlog", "LLM解析スキップ", f"LLM解析に失敗: {err_msg[:50]}")
 
             summarize_result = subprocess.run(
                 [sys.executable, "-m", "everlog.cli", "summarize", "--date", "today"],
@@ -409,17 +438,21 @@ def run_menubar() -> None:
             )
             run_id = trace_env.get("EVERLOG_OUTPUT_RUN_ID") or trace_env.get("EVERLOG_TRACE_RUN_ID") or ""
             if run_id:
-                out = get_paths().out_dir / _today() / run_id / f"{_today()}.md"
+                out_dir = get_paths().out_dir / _today() / run_id
             else:
-                out = get_paths().out_dir / f"{_today()}.md"
-            if summarize_result.returncode == 0 and out.exists():
-                if enrich_failed:
-                    rumps.notification("everlog", "生成完了", "マークダウンを開きます（LLMなし）")
+                out_dir = get_paths().out_dir
+            out = _latest_md_in_dir(out_dir)
+            if summarize_result.returncode == 0 and out and out.exists():
+                if run_enrich and enrich_failed:
+                    rumps.notification("everlog", "生成完了", "マークダウンを開きます（segment-llm失敗）")
                 else:
                     rumps.notification("everlog", "生成完了", "マークダウンを開きます")
                 _run(["open", str(out)])
             else:
-                err_msg = summarize_result.stderr.strip().split("\n")[-1] if summarize_result.stderr else "不明なエラー"
+                if summarize_result.returncode == 0:
+                    err_msg = "マークダウンが見つかりません"
+                else:
+                    err_msg = summarize_result.stderr.strip().split("\n")[-1] if summarize_result.stderr else "不明なエラー"
                 rumps.notification("everlog", "エラー", f"マークダウン生成失敗: {err_msg[:50]}")
 
         def on_quit(self, _):
