@@ -374,3 +374,89 @@ EVERLOG_NOTION_SYNC=1
 - `docs/NOTION_SYNC.md`: Notion同期の設計と設定方法
 - `docs/PIPLINE_3.md`: パイプライン詳細（Active Display First / 1時間タイムライン）
 - `docs/archive/APPIFICATION.md`: macOSアプリ化の経緯と手順
+
+---
+
+## 初期セットアップ手順まとめ（新規環境向け）
+
+GitHubからクローンして新しいMac環境で動かすための手順です。
+
+### 1. リポジトリのクローンとPython環境構築
+```sh
+git clone https://github.com/pronoun-studio/everlog.git
+cd everlog
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+pip install -e .
+```
+
+### 2. OCRバイナリのビルド（Xcode Command Line Tools必要）
+```sh
+# Xcode CLTがない場合は先にインストール
+xcode-select --install
+
+cd ocr/ecocr
+swift build -c release
+mkdir -p ../../EVERYTIME-LOG/bin
+cp -f .build/release/ecocr ../../EVERYTIME-LOG/bin/ecocr
+cp -f .build/release/ecdisplay ../../EVERYTIME-LOG/bin/ecdisplay
+cd ../..
+```
+
+### 3. .envファイルの作成（APIキー設定）
+```sh
+# プロジェクト直下に .env を作成
+cat > .env << 'EOF'
+OPENAI_API_KEY=sk-あなたのOpenAIキー
+EVERLOG_LLM_MODEL=gpt-5-nano
+
+# Notion同期を使う場合（任意）
+# NOTION_API_KEY=ntn_あなたのNotionキー
+# NOTION_DATABASE_ID=データベースID（32文字）
+# EVERLOG_NOTION_SYNC=1
+EOF
+```
+
+### 4. メニューバーアプリのビルド（推奨）
+**推奨**: `.app` に画面収録権限を付与するのが最も安定します。
+```sh
+pip install -r macos_app/requirements.txt
+cd macos_app
+python setup.py py2app
+cd ..
+```
+
+### 5. macOS権限の付与（手動）
+`システム設定 → プライバシーとセキュリティ → 画面収録とシステムオーディオ録音` で：
+- **推奨**: `macos_app/dist/everlog.app` を追加してON
+- または `.venv/bin/python` を追加してON
+
+### 6. 起動（推奨: メニューバーUI）
+```sh
+# メニューバーアプリを起動
+open macos_app/dist/everlog.app
+
+# ログイン時に自動起動したい場合
+./.venv/bin/everlog launchd menubar install
+```
+
+メニューバーから「●定期キャプチャの開始」「今日のマークダウン生成」などが利用できます。
+
+### 自動生成されるディレクトリ
+以下は初回実行時に自動で作成されます（手動作成不要）：
+- `EVERYTIME-LOG/` - ログ保存ディレクトリ
+  - `logs/` - キャプチャログ（JSONL）
+  - `out/` - 出力（マークダウン等）
+  - `trace/` - デバッグ用トレース
+  - `tmp/` - 一時ファイル
+  - `bin/` - OCRバイナリ配置場所（手順2で配置済み）
+
+### GitHubに含まれないもの（各環境で用意が必要）
+| ファイル/ディレクトリ | 理由 | 対応 |
+|---|---|---|
+| `.env` | APIキー等の機密情報 | 各自で作成（手順3） |
+| `.venv/` | Python仮想環境 | 各自でセットアップ（手順1） |
+| `EVERYTIME-LOG/` | ログ・出力データ | 初回実行で自動生成 |
+| `ocr/ecocr/.build/` | Swiftビルド成果物 | 各自でビルド（手順2） |
+| `macos_app/dist/` | py2appビルド成果物 | 各自でビルド（手順4） |
