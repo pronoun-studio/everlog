@@ -95,16 +95,27 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 ./.venv/bin/everlog launchd capture status
 ```
 
+再起動（設定変更を反映）:
+```sh
+./.venv/bin/everlog launchd capture restart
+```
+
+アンインストール:
+```sh
+./.venv/bin/everlog launchd capture uninstall
+```
+
 ### 3.5) launchd（日次処理: enrich + summarize）
 毎日23:55に `enrich` → `summarize` を自動実行します（`OPENAI_API_KEY` が必要）。
 ```sh
 ./.venv/bin/everlog launchd daily install
 ```
 
-停止/再開/状態確認/アンインストール:
+停止/再開/再起動/状態確認/アンインストール:
 ```sh
 ./.venv/bin/everlog launchd daily stop
 ./.venv/bin/everlog launchd daily start
+./.venv/bin/everlog launchd daily restart
 ./.venv/bin/everlog launchd daily status
 ./.venv/bin/everlog launchd daily uninstall
 ```
@@ -132,6 +143,11 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 状態確認:
 ```sh
 ./.venv/bin/everlog launchd menubar status
+```
+
+再起動:
+```sh
+./.venv/bin/everlog launchd menubar restart
 ```
 
 アンインストール:
@@ -187,11 +203,17 @@ open dist/everlog.app
 - 今日のキャプチャ回数: x回
 - 前回キャプチャ時間: yy/MM/dd H:mm
 
+### 進捗表示（マークダウン生成時）
+「今日のマークダウン生成」を実行すると、ネイティブの進捗パネルが表示されます:
+- 現在の処理ステージ名（データ読み込み → LLM要約 → Markdown生成 など）
+- 進捗パーセンテージ（プログレスバー）
+- 処理完了後に自動で閉じる
+
 ## macOSアプリ化（py2app）
 macOSの「画面収録」設定で `python` / `.venv/bin/python` が追加できない（追加しても一覧に反映されない）場合、
 `everlog` を `.app` としてビルドし、**その `.app` に画面収録権限を付与**するのが一番安定します。
 
-進捗や現状の詰まりどころは `APPIFICATION.md` にまとめています。
+進捗や現状の詰まりどころは `docs/archive/APPIFICATION.md` にまとめています。
 
 ### 権限付与のフロー（2パターン）
 **A. Pythonに権限付与（シンプル）**  
@@ -238,26 +260,117 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 ./.venv/bin/everlog launchd capture install
 ```
 
+### 5) 全停止（quit）
+`quit` コマンドで、定期キャプチャとメニューバーを停止し自動起動を無効化できます:
+```sh
+./.venv/bin/everlog quit
+```
+
+## Notion同期（任意）
+生成されたマークダウンを Notion データベースに自動同期できます。
+
+### 準備
+1. Notion Integration を作成（https://www.notion.so/my-integrations）
+2. 対象データベースに Integration を招待
+3. 環境変数を設定:
+```sh
+# .env に追加
+NOTION_API_KEY=ntn_xxxxxx...
+NOTION_DATABASE_ID=25ab3850f8c38153b303c6c408d7cd4e
+EVERLOG_NOTION_SYNC=1
+```
+
+### 同期タイミング
+- `summarize` 実行時に自動同期（`EVERLOG_NOTION_SYNC=1` の場合）
+- 同期失敗時は `~/.everlog/notion_pending.json` に記録され、次回 `summarize` 時に再試行
+
+### Notionデータベース構造
+| プロパティ名 | 型 | Everlogからの値 |
+|---|---|---|
+| `活動ログ` | Title | 日報タイトル |
+| `実施日_編集可` | Date | 対象日付 |
+| `ジャンル` | Multi-select | `AutoLog`（固定） |
+
+詳細: `docs/NOTION_SYNC.md`
+
 ## 保存先
 - ログ: `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`
 - 出力: `EVERYTIME-LOG/out/YYYY-MM-DD/<run_id>/`
-  - マークダウン: `YYYY-MM-DD.md`
+  - マークダウン: `YY-MM-DD_<daily_title>.md`
   - LLM結果: `YYYY-MM-DD.hourly.llm.json`, `YYYY-MM-DD.daily.llm.json`, `YYYY-MM-DD.hour-enrich.llm.json`
   - （任意）segment-llm結果: `YYYY-MM-DD.llm.json`
+- トレース: `EVERYTIME-LOG/trace/YYYY-MM-DD/<run_id>/`
+  - `run.json`, `stage-00.raw.jsonl`, `stage-01.entities.jsonl`, `stage-02.segment.jsonl` など
 - 一時: `EVERYTIME-LOG/tmp/`
 - バイナリ: `EVERYTIME-LOG/bin/`（OCRヘルパー `ecocr` など）
 - 設定: `EVERYTIME-LOG/config.json`
 - launchdログ: `~/.everlog/capture.out.log`, `capture.err.log`, `menubar.*.log`, `daily.*.log`
+- Notion pending: `~/.everlog/notion_pending.json`
 
 ## 環境変数
+### 基本設定
+- `EVERLOG_LOG_HOME`: ログ保存先ディレクトリ（デフォルト: プロジェクト直下の `EVERYTIME-LOG/`、互換: `EVERYTIMECAPTURE_LOG_HOME`）
 - `EVERLOG_OCR_BIN`: OCRヘルパーのパス（互換: `EVERYTIMECAPTURE_OCR_BIN`）
+- `EVERLOG_DISPLAY_BIN`: アクティブディスプレイ推定ヘルパーのパス（互換: `EVERYTIMECAPTURE_DISPLAY_BIN`）
 - `EVERLOG_CAPTURE_APP`: 画面収録権限を付与した `.app` のパス（互換: `EVERYTIMECAPTURE_CAPTURE_APP`）
+
+### LLM要約
 - `OPENAI_API_KEY`: LLM要約（`enrich`）に必要
 - `EVERLOG_LLM_MODEL`: LLMモデル名（default `gpt-5-nano`、互換: `EVERYTIMECAPTURE_LLM_MODEL`）
+
+### Notion同期
+- `NOTION_API_KEY`: Notion Integration Token
+- `NOTION_DATABASE_ID`: 同期先データベースID（32文字、ハイフンは自動削除）
+- `EVERLOG_NOTION_SYNC`: `1` で同期を有効化
+
+### プライバシー/安全
 - `EVERLOG_SAFE_MARKDOWN`: 最終Markdown/Notion同期のタイトルで、PII・認証情報・典型的なトークン等をローカルでマスクする（default: 有効）。無効化する場合は `0` を指定（互換: `EVERYTIMECAPTURE_SAFE_MARKDOWN`）
 
+### デバッグ/トレース
+- `EVERLOG_TRACE_STAGE_MAX`: トレース出力の最大ステージ番号（default: `2`。`3`〜`7` で中間ファイルを増やす）
+- `EVERLOG_OUTPUT_RUN_ID`: 出力ディレクトリの `run_id` を固定（通常は自動生成）
+- `EVERLOG_TRACE_RUN_ID`: トレースディレクトリの `run_id` を固定（通常は自動生成）
+
+## 設定ファイル（config.json）
+`EVERYTIME-LOG/config.json` で以下を設定できます:
+```json
+{
+  "interval_sec": 300,         // キャプチャ間隔（秒）
+  "browser": "chrome",         // URL取得対象ブラウザ
+  "keep_screenshots": false,   // スクリーンショットを保持するか
+  "capture_app_path": null,    // 画面収録権限を付与した.appのパス
+  "exclude": {
+    "apps": ["1Password"],     // 除外アプリ
+    "domain_keywords": [...],  // 除外ドメインキーワード
+    "text_keywords": [...]     // 除外テキストキーワード
+  },
+  "redact": {
+    "enable_email": true,      // メールアドレスをマスク
+    "enable_phone": false,     // 電話番号をマスク
+    "enable_credit_card": true,// カード番号をマスク（Luhnチェック）
+    "enable_auth_nearby": true // 認証キーワード近傍をマスク
+  }
+}
+```
+
+## パイプライン概要
+`summarize` コマンドは以下のステージを経てMarkdownを生成します:
+1. **stage-00.raw**: 生データ保存
+2. **stage-01.entities**: 特徴抽出（アプリ/ドメイン/URL/パス）
+3. **stage-02.segment**: セグメント化（連続した同一作業をグループ化）
+4. **stage-03.segment**: セグメント内OCR統合（重複削除）
+5. **stage-04.hour-pack**: 1時間単位でパッケージ化
+6. **stage-05.hour-llm**: LLMで1時間ごとの要約生成
+7. **stage-06.daily-llm**: LLMで1日全体の総括生成
+8. **stage-07.hour-enrich-llm**: 各時間帯の目的・意味を再解釈
+
+詳細: `docs/PIPLINE_3.md`
+
 ## 詳細ドキュメント
-- `DESIGN.md`: 設計仕様（要件・データ形式・実行形態・プライバシー方針）
-- `ARCHITECTURE.md`: 実装マップ（ファイル別の役割と連携）
-- `EXCLUSIONS.md`: 除外・マスキングルール
-- `APPIFICATION.md`: macOSアプリ化の経緯と手順
+- `docs/DESIGN.md`: 設計仕様（要件・データ形式・実行形態・プライバシー方針）
+- `docs/ARCHITECTURE.md`: 実装マップ（ファイル別の役割と連携）
+- `docs/EXCLUSIONS.md`: 除外・マスキングルール
+- `docs/PRIVACY-CONTENTS.md`: プライバシー保護対象の分類（PII/認証/金融/機微情報など）
+- `docs/NOTION_SYNC.md`: Notion同期の設計と設定方法
+- `docs/PIPLINE_3.md`: パイプライン詳細（Active Display First / 1時間タイムライン）
+- `docs/archive/APPIFICATION.md`: macOSアプリ化の経緯と手順

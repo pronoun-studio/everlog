@@ -108,3 +108,18 @@
 - 出力先: `EVERYTIME-LOG/out/<date>/<run_id>/<yy-mm-dd_daily_title>.md`
 - ファイル名に `daily_title` を含めることで、日報の内容が一目で分かる
 - `out/<date>.md` への「latest」コピーは廃止。常に `out/<date>/<run_id>/` に格納する
+
+### 11.1 安全サニタイズ（漏えい対策 / 最終出力のみ）
+最終Markdownは基本的にローカルで自分だけが見る想定だが、**万が一漏れた場合**に備えて、
+Markdown生成の最終段（`summarize` の書き出し直前）で「共有しても危険になりやすい情報」をローカルでマスクする。
+
+- **適用範囲**: 最終Markdown（および Notion同期で使うタイトル）
+- **非適用範囲**: stage-00〜stage-04（ルールベース加工段階）などのローカル中間データ
+- **制御**: 環境変数 `EVERLOG_SAFE_MARKDOWN`
+  - デフォルト **有効**（未設定でもON）
+  - 無効化: `EVERLOG_SAFE_MARKDOWN=0`（互換: `EVERYTIMECAPTURE_SAFE_MARKDOWN=0`）
+
+マスク例（代表）:
+- 個人情報/認証情報（メール/電話/カード/OTP/パスワード近傍）
+- 典型的なAPIキー/トークン（`sk-...`、GitHub/Slackトークン、JWT 等）
+- 秘密鍵ブロック（`BEGIN ... PRIVATE KEY`）

@@ -8,9 +8,12 @@ from collections import Counter, defaultdict
 from datetime import datetime
 from pathlib import Path
 from typing import Any
+import difflib
 import json
 import os
 import re
+
+from typing import Callable
 
 from .jsonl import read_jsonl
 from .config import load_config
@@ -19,6 +22,9 @@ from .segments import build_segments, build_segments_with_event_trace
 from .llm import LlmError, analyze_day_summary, analyze_hour_blocks, calc_cost_usd
 from .safety import sanitize_markdown_for_sharing, sanitize_text_for_sharing
 from .timeutil import make_run_id, normalize_date_arg
+
+# Progress callback type: (percent: int, stage: str) -> None
+ProgressCallback = Callable[[int, str], None]
 
 
 _CONCRETE_TOKEN_RE = re.compile(
@@ -40,6 +46,25 @@ def _shorten_text(s: str, max_len: int = 80) -> str:
     if len(s) <= max_len:
         return s
     return s[: max_len - 1].rstrip() + "…"
+
+
+_SIMILARITY_STRIP_RE = re.compile(r"[\s\u3000\u3001\u3002.,!?！？:：;；\-–—/\\()（）「」『』【】\[\]{}<>＜＞\"'・]")
+
+
+def _normalize_for_similarity(s: str) -> str:
+    return _SIMILARITY_STRIP_RE.sub("", (s or "").strip().lower())
+
+
+def _is_near_duplicate(a: str, b: str, threshold: float = 0.88) -> bool:
+    na = _normalize_for_similarity(a)
+    nb = _normalize_for_similarity(b)
+    if not na or not nb:
+        return False
+    if na == nb:
+        return True
+    if len(na) >= 12 and (na in nb or nb in na):
+        return True
+    return difflib.SequenceMatcher(None, na, nb).ratio() >= threshold
 
 
 def _sanitize_title_for_filename(title: str, max_len: int = 80) -> str:
@@ -1131,7 +1156,30 @@ def _build_segment_groups(event_trace: list[dict[str, Any]]) -> list[dict[str, A
     return rows
 
 
-def summarize_day_to_markdown(date_arg: str) -> Path:
+def summarize_day_to_markdown(
+    date_arg: str,
+    *,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    """Generate a markdown report for the specified date.
+
+    Args:
+        date_arg: Date string (e.g. "today", "2026-02-09")
+        progress_callback: Optional callback (percent, stage_name) for progress updates.
+            - 0%: stage-00 開始（raw data読込）
+            - 10%: stage-01 完了（entities抽出）
+            - 20%: stage-03 完了（segment化）
+            - 30%: stage-04 完了（hour-pack）
+            - 50%: stage-05 hour-llm 実行中
+            - 70%: stage-06 daily-llm 実行中
+            - 85%: stage-07 hour-enrich-llm 実行中
+            - 100%: マークダウン生成完了
+    """
+
+    def _progress(percent: int, stage: str) -> None:
+        if progress_callback:
+            progress_callback(percent, stage)
+
     date = normalize_date_arg(date_arg)
     ensure_dirs()
     p = get_paths()
@@ -1188,11 +1236,13 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     out_dir.mkdir(parents=True, exist_ok=True)
     # NOTE: out/<date>.md への「latest」コピーは廃止。常に out/<date>/<run_id>/ に格納する。
 
+    _progress(0, "stage-00: ログ読込中")
     events = read_jsonl(log_path)
     if not events:
         out_name = _md_output_name(date, "作業ログ", out_suffix)
         out_path = out_dir / out_name
         out_path.write_text(f"# 作業ログ {date}\n\n（ログがありません）\n", encoding="utf-8")
+        _progress(100, "完了（ログなし）")
         return out_path
 
     capture_count = len(events)
@@ -1205,9 +1255,12 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     start = dt_list_sorted[0] if dt_list_sorted else None
     end = dt_list_sorted[-1] if dt_list_sorted else None
 
+    _progress(10, "stage-01: 特徴抽出中")
     interval_sec = int((events[-1].get("interval_sec") if events else 0) or 0) or 300
     segments, event_trace = build_segments_with_event_trace(events, interval_sec)
+    _progress(20, "stage-03: セグメント化中")
     segment_rows = _build_segment_groups(event_trace)
+    _progress(30, "stage-04: hour-pack作成中")
     hour_packs = _build_hour_packs(events, segment_rows, interval_sec)
     if trace_enabled:
         run_dir = _trace_dir(date, trace_run_id)
@@ -1253,6 +1306,7 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
     hourly_llm_meta = _load_hourly_llm_meta(date, run_id=output_run_id)
     if hourly_llm_required and not hourly_llm_map:
+        _progress(50, "stage-05: hour-llm 実行中")
         hourly_out = _maybe_run_hourly_llm(date, hour_packs)
         if hourly_out:
             _hourly_llm_path(date, run_id=output_run_id).write_text(
@@ -1264,6 +1318,7 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
 
     daily_llm = _load_daily_llm(date, run_id=output_run_id)
     if _daily_llm_enabled() and not daily_llm and hour_packs:
+        _progress(70, "stage-06: daily-llm 実行中")
         daily_out = _maybe_run_daily_llm(
             date,
             hour_packs=hour_packs,
@@ -1288,6 +1343,7 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
         except Exception:
             hour_enrich_llm_meta = {}
     if _hour_enrich_llm_enabled() and not hour_enrich_llm_map and daily_llm and hourly_llm_map:
+        _progress(85, "stage-07: hour-enrich-llm 実行中")
         hour_enrich_out = _maybe_run_hour_enrich_llm(
             date,
             daily_llm=daily_llm,
@@ -1605,7 +1661,10 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
             if cluster_labels:
                 lines.append(f"- 主な作業画面: {', '.join(cluster_labels[:2])}")
             if hour_summary_enriched:
-                lines.append(f"- 推測される意図: {hour_summary_enriched}")
+                if _is_near_duplicate(display_summary, hour_summary_enriched):
+                    lines.append("- 推測される意図: （観測の要約と近いため省略）")
+                else:
+                    lines.append(f"- 推測される意図: {hour_summary_enriched}")
             lines.append("")
 
     if trace_enabled:
@@ -1649,6 +1708,7 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
     lines.append(f"- 除外: {len(excluded_events)}回")
     lines.append(f"- スクショ/OCR失敗: {len(error_events)}回")
 
+    _progress(95, "マークダウン書き出し中")
     md = "\n".join(lines).rstrip() + "\n"
     if safe_md_enabled:
         md = sanitize_markdown_for_sharing(md, cfg)
@@ -1663,4 +1723,5 @@ def summarize_day_to_markdown(date_arg: str) -> Path:
         daily_llm_path = _daily_llm_path(date, run_id=output_run_id)
         sync_daily(date, output_run_id, out_path, daily_llm_path)
 
+    _progress(100, "完了")
     return out_path

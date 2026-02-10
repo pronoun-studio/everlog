@@ -33,6 +33,20 @@ EVERYTIME-LOG/out/2026-02-06/004450-885721/26-02-06_Everlog起動とLLMパイプ
 - `daily_title` が取得できない場合は `<yy-mm-dd>_作業ログ.md`
 - `out/<date>.md` への直接出力は廃止され、常に `out/<date>/<run_id>/` に格納される
 
+#### ✅ 安全サニタイズ（漏えい対策 / 最終出力のみ）
+最終Markdownは基本的にローカルで自分だけが見る想定だが、万が一どこかに漏れた場合に備えて、
+**Markdown生成の最終段（書き出し直前）でローカルサニタイズ**をかける。
+
+- **目的**: `docs/PRIVACY-CONTENTS.md` にあるような「弾かれやすい/危険になりやすい情報」を最終成果物から落とす
+- **適用範囲**: 最終Markdown（および Notion同期で使うタイトル）
+- **非適用範囲**: stage-00〜stage-04（ルールベース加工段階）などのローカル中間データ
+- **制御**: `EVERLOG_SAFE_MARKDOWN`（デフォルト有効、無効化は `EVERLOG_SAFE_MARKDOWN=0`）
+
+マスク例（代表）:
+- 個人情報/認証情報（メール/電話/カード/OTP/パスワード近傍）
+- 典型的なAPIキー/トークン（`sk-...`、GitHub/Slackトークン、JWT 等）
+- 秘密鍵ブロック（`BEGIN ... PRIVATE KEY`）
+
 ---
 
 ## 🔄 ステージ別データ変換（具体例つき）
@@ -379,6 +393,10 @@ EVERYTIME-LOG/out/2026-02-06/004450-885721/26-02-06_Everlog起動とLLMパイプ
   - （任意）`out/<date>/<run_id>/<date>.llm.json`（segment-llm / enrich）
 
 **出力**: `EVERYTIME-LOG/out/2026-02-06/004450-885721/26-02-06_Everlog起動とLLMパイプライン設計の全日検討.md`
+
+**安全サニタイズ（重要）**:
+- Markdown書き出し直前に `EVERLOG_SAFE_MARKDOWN` が有効なら、共有して危険になりやすい情報をローカルでマスクする
+- LLMの「生成基準による拒否」に依存せず、**最終成果物に残さない保証**を持つための層
 
 **ヘッダーの形式**:
 - `daily_title` がある場合: `# <yy-mm-dd>_<daily_title>`

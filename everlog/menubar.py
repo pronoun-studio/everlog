@@ -8,6 +8,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 from datetime import datetime
 from pathlib import Path
 
@@ -17,6 +18,118 @@ from .launchd import capture_program_args
 from .llm import _load_dotenv_if_needed
 from .paths import get_paths
 from .timeutil import make_run_id
+
+
+class ProgressPanel:
+    """macOS native progress panel using PyObjC."""
+
+    def __init__(self, title: str = "処理中..."):
+        try:
+            from AppKit import (
+                NSPanel,
+                NSMakeRect,
+                NSProgressIndicator,
+                NSTextField,
+                NSFont,
+                NSColor,
+                NSWindowStyleMaskTitled,
+                NSWindowStyleMaskClosable,
+                NSBackingStoreBuffered,
+                NSProgressIndicatorBarStyle,
+            )
+            from PyObjCTools import AppHelper
+
+            self._AppHelper = AppHelper
+
+            # Create panel
+            panel_width = 360
+            panel_height = 100
+            self._panel = NSPanel.alloc().initWithContentRect_styleMask_backing_defer_(
+                NSMakeRect(0, 0, panel_width, panel_height),
+                NSWindowStyleMaskTitled | NSWindowStyleMaskClosable,
+                NSBackingStoreBuffered,
+                False,
+            )
+            self._panel.setTitle_(title)
+            self._panel.setLevel_(3)  # Floating level
+            self._panel.center()
+
+            content = self._panel.contentView()
+
+            # Progress bar
+            self._progress = NSProgressIndicator.alloc().initWithFrame_(
+                NSMakeRect(20, 40, panel_width - 40, 20)
+            )
+            self._progress.setStyle_(NSProgressIndicatorBarStyle)
+            self._progress.setMinValue_(0)
+            self._progress.setMaxValue_(100)
+            self._progress.setDoubleValue_(0)
+            self._progress.setIndeterminate_(False)
+            content.addSubview_(self._progress)
+
+            # Status label
+            self._label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(20, 65, panel_width - 40, 20)
+            )
+            self._label.setStringValue_("準備中...")
+            self._label.setBezeled_(False)
+            self._label.setDrawsBackground_(False)
+            self._label.setEditable_(False)
+            self._label.setSelectable_(False)
+            self._label.setFont_(NSFont.systemFontOfSize_(13))
+            content.addSubview_(self._label)
+
+            # Percent label
+            self._percent_label = NSTextField.alloc().initWithFrame_(
+                NSMakeRect(20, 15, panel_width - 40, 20)
+            )
+            self._percent_label.setStringValue_("0%")
+            self._percent_label.setBezeled_(False)
+            self._percent_label.setDrawsBackground_(False)
+            self._percent_label.setEditable_(False)
+            self._percent_label.setSelectable_(False)
+            self._percent_label.setFont_(NSFont.monospacedDigitSystemFontOfSize_weight_(12, 0.5))
+            self._percent_label.setTextColor_(NSColor.secondaryLabelColor())
+            content.addSubview_(self._percent_label)
+
+            self._available = True
+        except ImportError:
+            self._available = False
+            self._panel = None
+
+    def show(self):
+        """Show the progress panel."""
+        if self._available and self._panel:
+            self._panel.makeKeyAndOrderFront_(None)
+
+    def hide(self):
+        """Hide the progress panel."""
+        if self._available and self._panel:
+            self._panel.orderOut_(None)
+
+    def update(self, percent: int, stage: str):
+        """Update progress display."""
+        if not self._available:
+            return
+
+        def do_update():
+            if self._progress:
+                self._progress.setDoubleValue_(float(percent))
+            if self._label:
+                self._label.setStringValue_(stage)
+            if self._percent_label:
+                self._percent_label.setStringValue_(f"{percent}%")
+
+        # Schedule on main thread
+        try:
+            from PyObjCTools import AppHelper
+            AppHelper.callAfter(do_update)
+        except Exception:
+            do_update()
+
+    @property
+    def available(self) -> bool:
+        return self._available
 
 
 def _require_rumps():
@@ -185,10 +298,8 @@ def run_menubar() -> None:
                 self.status_item,
                 None,
                 self.autostart_item,
-                rumps.MenuItem("everlogを再起動", callback=self.on_install_reload),
                 self.start_item,
                 self.stop_item,
-                rumps.MenuItem("再起動（Restart）", callback=self.on_restart),
                 None,
                 self.interval_items[10],
                 self.interval_items[60],
@@ -199,6 +310,7 @@ def run_menubar() -> None:
                 None,
                 rumps.MenuItem("今すぐ1回キャプチャ", callback=self.on_capture_now),
                 rumps.MenuItem("今日のマークダウン生成", callback=self.on_summarize_today),
+                rumps.MenuItem("日付を指定してマークダウン生成", callback=self.on_summarize_date),
                 None,
                 rumps.MenuItem("終了", callback=self.on_quit),
             ]
@@ -222,11 +334,6 @@ def run_menubar() -> None:
             self._sync_interval_menu()
             self._sync_autostart_menu()
 
-        def on_install_reload(self, _):
-            _run_cli(["launchd", "capture", "install"])
-            self.on_tick(None)
-            rumps.notification("everlog", "Install/Reload", "定期キャプチャを（再）インストールしました")
-
         def on_start(self, _):
             _run_cli(["launchd", "capture", "install"])
             self.on_tick(None)
@@ -236,11 +343,6 @@ def run_menubar() -> None:
             _run_cli(["launchd", "capture", "stop"])
             self.on_tick(None)
             rumps.notification("everlog", "Stop", "定期キャプチャを停止しました")
-
-        def on_restart(self, _):
-            _run_cli(["launchd", "capture", "restart"])
-            self.on_tick(None)
-            rumps.notification("everlog", "Restart", "定期キャプチャを再起動しました")
 
         def _set_interval(self, sec: int):
             cfg = load_config()
@@ -375,85 +477,125 @@ def run_menubar() -> None:
             finally:
                 self.on_tick(None)
 
-        def on_summarize_today(self, _):
-            rumps.notification("everlog", "生成開始", "今日のマークダウンを生成中...")
-            trace_env = os.environ.copy()
-            trace_env["EVERLOG_TRACE"] = "1"
-            trace_env["EVERLOG_TRACE_RUN_ID"] = make_run_id()
-            trace_env["EVERLOG_OUTPUT_RUN_ID"] = trace_env["EVERLOG_TRACE_RUN_ID"]
-            # Hourly LLM is required for "complete" timeline output.
-            trace_env["EVERLOG_HOURLY_LLM"] = "1"
-            # Daily LLM summary (uses hour summaries, low incremental cost).
-            trace_env["EVERLOG_DAILY_LLM"] = "1"
-            try:
-                run_id = trace_env["EVERLOG_TRACE_RUN_ID"]
-                run_dir = get_paths().trace_dir / _today() / run_id
-                run_dir.mkdir(parents=True, exist_ok=True)
-                (run_dir / "run.json").write_text(
-                    json.dumps(
-                        {
-                            "run_id": run_id,
-                            "source": "menubar",
-                            "started_at": datetime.now().astimezone().isoformat(),
-                        },
-                        ensure_ascii=False,
-                    )
-                    + "\n",
-                    encoding="utf-8",
-                )
-            except Exception as e:
-                _debug(f"trace_run_dir: failed: {e}")
-            # enrich (segment-llm) is optional and disabled by default.
-            run_enrich = str(trace_env.get("EVERLOG_RUN_ENRICH") or "").strip() in {
-                "1",
-                "true",
-                "TRUE",
-                "yes",
-                "YES",
-            }
-            enrich_failed = False
-            if run_enrich:
-                # enrichが失敗してもsummarizeは実行する（LLMなしでもMarkdownは生成可能）
-                enrich_result = subprocess.run(
-                    [sys.executable, "-m", "everlog.cli", "enrich", "--date", "today"],
-                    env=trace_env,
-                    capture_output=True,
-                    text=True,
-                    encoding="utf-8",
-                    check=False,
-                )
-                enrich_failed = enrich_result.returncode != 0
-                if enrich_failed:
-                    # LLM解析失敗時は警告を出すが、summarizeは続行
-                    err_msg = enrich_result.stderr.strip().split("\n")[-1] if enrich_result.stderr else "不明なエラー"
-                    rumps.notification("everlog", "LLM解析スキップ", f"LLM解析に失敗: {err_msg[:50]}")
+        def _run_summarize(self, target_date: str, date_str: str):
+            """Run summarize for the specified date with progress display.
 
-            summarize_result = subprocess.run(
-                [sys.executable, "-m", "everlog.cli", "summarize", "--date", "today"],
-                env=trace_env,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                check=False,
+            Args:
+                target_date: Date string to pass to CLI (e.g. "today", "2026-02-09")
+                date_str: Date in YYYY-MM-DD format for output directory
+            """
+            # 進捗パネルを作成
+            panel = ProgressPanel(f"マークダウン生成中: {date_str}")
+            panel.show()
+            panel.update(0, "準備中...")
+
+            def progress_callback(percent: int, stage: str):
+                """Callback for progress updates from summarize."""
+                panel.update(percent, stage)
+
+            def run_summarize_thread():
+                """Background thread to run summarize."""
+                out_path = None
+                error_msg = None
+                try:
+                    # Load .env for API keys
+                    _load_dotenv_if_needed()
+
+                    # Set up environment
+                    run_id = make_run_id()
+                    os.environ["EVERLOG_TRACE"] = "1"
+                    os.environ["EVERLOG_TRACE_RUN_ID"] = run_id
+                    os.environ["EVERLOG_OUTPUT_RUN_ID"] = run_id
+                    os.environ["EVERLOG_HOURLY_LLM"] = "1"
+                    os.environ["EVERLOG_DAILY_LLM"] = "1"
+
+                    try:
+                        run_dir = get_paths().trace_dir / date_str / run_id
+                        run_dir.mkdir(parents=True, exist_ok=True)
+                        (run_dir / "run.json").write_text(
+                            json.dumps(
+                                {
+                                    "run_id": run_id,
+                                    "source": "menubar",
+                                    "started_at": datetime.now().astimezone().isoformat(),
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n",
+                            encoding="utf-8",
+                        )
+                    except Exception as e:
+                        _debug(f"trace_run_dir: failed: {e}")
+
+                    # Import and run summarize directly with progress callback
+                    from .summarize import summarize_day_to_markdown
+
+                    out_path = summarize_day_to_markdown(
+                        target_date,
+                        progress_callback=progress_callback,
+                    )
+
+                except Exception as e:
+                    _debug(f"summarize_thread: exception={e}")
+                    error_msg = str(e)
+
+                # 完了処理をメインスレッドで
+                def show_completion():
+                    panel.hide()
+                    if error_msg:
+                        rumps.notification("everlog", "エラー", f"マークダウン生成失敗: {error_msg[:50]}")
+                    elif out_path and out_path.exists():
+                        rumps.notification("everlog", "生成完了", "マークダウンを開きます")
+                        _run(["open", str(out_path)])
+                    else:
+                        rumps.notification("everlog", "エラー", "マークダウンが見つかりません")
+
+                try:
+                    from PyObjCTools import AppHelper
+                    AppHelper.callAfter(show_completion)
+                except Exception:
+                    rumps.Timer(show_completion, 0).start()
+
+            # バックグラウンドスレッドで実行
+            thread = threading.Thread(target=run_summarize_thread, daemon=True)
+            thread.start()
+
+        def on_summarize_today(self, _):
+            self._run_summarize("today", _today())
+
+        def on_summarize_date(self, _):
+            # Show date input dialog
+            win = rumps.Window(
+                message="日付を YYYY-MM-DD 形式で入力してください（例: 2026-02-09）",
+                title="日付を指定してマークダウン生成",
+                default_text=_today(),
+                ok="生成",
+                cancel="キャンセル",
+                dimensions=(300, 24),
             )
-            run_id = trace_env.get("EVERLOG_OUTPUT_RUN_ID") or trace_env.get("EVERLOG_TRACE_RUN_ID") or ""
-            if run_id:
-                out_dir = get_paths().out_dir / _today() / run_id
-            else:
-                out_dir = get_paths().out_dir
-            out = _latest_md_in_dir(out_dir)
-            if summarize_result.returncode == 0 and out and out.exists():
-                if run_enrich and enrich_failed:
-                    rumps.notification("everlog", "生成完了", "マークダウンを開きます（segment-llm失敗）")
-                else:
-                    rumps.notification("everlog", "生成完了", "マークダウンを開きます")
-                _run(["open", str(out)])
-            else:
-                if summarize_result.returncode == 0:
-                    err_msg = "マークダウンが見つかりません"
-                else:
-                    err_msg = summarize_result.stderr.strip().split("\n")[-1] if summarize_result.stderr else "不明なエラー"
-                rumps.notification("everlog", "エラー", f"マークダウン生成失敗: {err_msg[:50]}")
+            res = win.run()
+            if not res.clicked:
+                return
+            date_input = res.text.strip()
+            # Validate date format
+            try:
+                parsed_date = datetime.strptime(date_input, "%Y-%m-%d").date()
+                date_str = parsed_date.isoformat()
+            except ValueError:
+                rumps.alert(
+                    "日付形式が不正です",
+                    "YYYY-MM-DD 形式で入力してください（例: 2026-02-09）",
+                )
+                return
+            # Check if log file exists for the date
+            log_path = get_paths().logs_dir / f"{date_str}.jsonl"
+            if not log_path.exists():
+                rumps.alert(
+                    "ログが見つかりません",
+                    f"{date_str} のログファイルが存在しません。",
+                )
+                return
+            self._run_summarize(date_str, date_str)
 
         def on_quit(self, _):
             _run_cli(["launchd", "capture", "uninstall"])
