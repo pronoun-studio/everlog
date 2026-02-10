@@ -13,7 +13,7 @@ macOSの「画面収録」設定で `python` / `.venv/bin/python` が追加で�
 ```sh
 cd macos_app
 ../.venv/bin/python -m pip install -r ../requirements.txt
-../.venv/bin/python -m pip install -r ../requirements-macos-app.txt
+../.venv/bin/python -m pip install -r requirements.txt
 ../.venv/bin/python setup.py py2app
 ```
 

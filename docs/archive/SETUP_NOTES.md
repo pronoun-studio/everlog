@@ -106,7 +106,7 @@ launchctl list | rg -n "everlog|everytimecapture" || true
 ### ビルド
 ```sh
 pip install -r requirements.txt
-pip install -r requirements-macos-app.txt
+pip install -r macos_app/requirements.txt
 cd macos_app
 python setup.py py2app
 ```

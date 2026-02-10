@@ -26,7 +26,7 @@ How: 現象→仮説→実施した変更→現状→次の手順 の順で短�
 「System Settingsで権限を付けられる対象」に寄せる。
 
 ### A) `py2app`（本命・GUI拡張しやすい）
-- 追加: `macos_app/setup.py:1` / `macos_app/Everlog.py:1` / `requirements-macos-app.txt:1`
+- 追加: `macos_app/setup.py` / `macos_app/Everlog.py` / `macos_app/requirements.txt`
 - ただし現状、この環境はネットワーク制限があり `pip install py2app` が失敗する可能性が高い
 
 ### B) AppleScript/JXAの最小 `.app`（pip不要・当面の回避策）
