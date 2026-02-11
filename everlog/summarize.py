@@ -12,6 +12,7 @@ import difflib
 import json
 import os
 import re
+import time
 
 from typing import Callable
 
@@ -638,6 +639,26 @@ def _build_hourly_llm_input(hour_packs: list[dict[str, Any]]) -> list[dict[str, 
     return out
 
 
+def _is_retryable_llm_error(err: LlmError) -> bool:
+    """Return True for transient failures worth retrying once or twice."""
+    msg = str(err or "").lower()
+    retryable_tokens = (
+        "timed out",
+        "timeout",
+        "tempor",
+        "rate limit",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+        "service unavailable",
+        "connection reset",
+        "broken pipe",
+    )
+    return any(tok in msg for tok in retryable_tokens)
+
+
 def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not _hourly_llm_enabled():
         return None
@@ -666,9 +687,17 @@ def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[s
     payload = _build_hourly_llm_input(eligible)
     if not payload:
         return None
-    try:
-        res = analyze_hour_blocks(date, payload, model_name, api_key)
-    except LlmError:
+    # Retry transient API/network failures so one flaky call does not disable timeline LLM.
+    res = None
+    for attempt in range(3):
+        try:
+            res = analyze_hour_blocks(date, payload, model_name, api_key)
+            break
+        except LlmError as e:
+            if attempt >= 2 or not _is_retryable_llm_error(e):
+                return None
+            time.sleep(1.0 + float(attempt))
+    if res is None:
         return None
     cost_usd = calc_cost_usd(res.usage, res.model)
     return {
@@ -735,9 +764,16 @@ def _maybe_run_daily_llm(
         or "gpt-5-nano"
     )
 
-    try:
-        res = analyze_day_summary(date, hours_in, model_name, api_key)
-    except LlmError:
+    res = None
+    for attempt in range(3):
+        try:
+            res = analyze_day_summary(date, hours_in, model_name, api_key)
+            break
+        except LlmError as e:
+            if attempt >= 2 or not _is_retryable_llm_error(e):
+                return None
+            time.sleep(1.0 + float(attempt))
+    if res is None:
         return None
     cost_usd = calc_cost_usd(res.usage, res.model)
     data = res.data if isinstance(res.data, dict) else {}
@@ -823,11 +859,18 @@ def _maybe_run_hour_enrich_llm(
         or "gpt-5-nano"
     )
 
-    from .llm import enrich_hours_with_context, LlmError
+    from .llm import enrich_hours_with_context
 
-    try:
-        res = enrich_hours_with_context(date, daily_context, hours_overview, model_name, api_key)
-    except LlmError:
+    res = None
+    for attempt in range(3):
+        try:
+            res = enrich_hours_with_context(date, daily_context, hours_overview, model_name, api_key)
+            break
+        except LlmError as e:
+            if attempt >= 2 or not _is_retryable_llm_error(e):
+                return None
+            time.sleep(1.0 + float(attempt))
+    if res is None:
         return None
 
     cost_usd = calc_cost_usd(res.usage, res.model)
