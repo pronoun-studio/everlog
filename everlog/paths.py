@@ -6,7 +6,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
+import re
+import shutil
+import time
 import os
 
 
@@ -78,6 +82,77 @@ def _log_home_override() -> Path | None:
     return Path(val).expanduser()
 
 
+_OUT_DAY_DIR_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})(?:-\d+)?$")
+_LAST_OUT_CLEANUP_AT = 0.0
+
+
+def _out_retention_days() -> int:
+    raw = (
+        os.environ.get("EVERLOG_OUT_RETENTION_DAYS")
+        or os.environ.get("EVERYTIMECAPTURE_OUT_RETENTION_DAYS")
+        or ""
+    ).strip()
+    try:
+        v = int(raw) if raw else 7
+    except Exception:
+        v = 7
+    return max(1, v)
+
+
+def _out_cleanup_interval_sec() -> int:
+    raw = (
+        os.environ.get("EVERLOG_OUT_CLEANUP_INTERVAL_SEC")
+        or os.environ.get("EVERYTIMECAPTURE_OUT_CLEANUP_INTERVAL_SEC")
+        or ""
+    ).strip()
+    try:
+        v = int(raw) if raw else 3600
+    except Exception:
+        v = 3600
+    return max(0, v)
+
+
+def _cleanup_old_out_dirs(paths: AppPaths) -> None:
+    """
+    Remove dated output directories under out/ when they are older than retention days.
+    Target names:
+      - YYYY-MM-DD
+      - YYYY-MM-DD-<n>
+    """
+    out_dir = paths.out_dir
+    if not out_dir.exists():
+        return
+    retention_days = _out_retention_days()
+    today = datetime.now().astimezone().date()
+    for child in out_dir.iterdir():
+        if not child.is_dir():
+            continue
+        m = _OUT_DAY_DIR_RE.match(child.name)
+        if not m:
+            continue
+        try:
+            day = datetime.strptime(m.group(1), "%Y-%m-%d").date()
+        except Exception:
+            continue
+        age_days = (today - day).days
+        if age_days >= retention_days:
+            shutil.rmtree(child, ignore_errors=True)
+
+
+def _maybe_cleanup_old_out_dirs(paths: AppPaths) -> None:
+    global _LAST_OUT_CLEANUP_AT
+    now = time.time()
+    interval = _out_cleanup_interval_sec()
+    if interval > 0 and (now - _LAST_OUT_CLEANUP_AT) < interval:
+        return
+    _LAST_OUT_CLEANUP_AT = now
+    try:
+        _cleanup_old_out_dirs(paths)
+    except Exception:
+        # Cleanup should never break regular capture/summarize flow.
+        pass
+
+
 def get_paths() -> AppPaths:
     override = _log_home_override()
     if override:
@@ -130,4 +205,5 @@ def ensure_dirs() -> AppPaths:
     paths.tmp_dir.mkdir(parents=True, exist_ok=True)
     paths.bin_dir.mkdir(parents=True, exist_ok=True)
     paths.trace_dir.mkdir(parents=True, exist_ok=True)
+    _maybe_cleanup_old_out_dirs(paths)
     return paths

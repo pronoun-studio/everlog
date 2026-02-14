@@ -286,11 +286,13 @@ def run_menubar() -> None:
                 (10, "10秒（デバッグ用）"),
                 (60, "1分"),
                 (300, "5分（デフォルト）"),
-                (600, "10分"),
-                (1800, "30分"),
             ]:
                 item = rumps.MenuItem(f"間隔: {label}", callback=lambda _, s=sec: self._set_interval(s))
                 self.interval_items[sec] = item
+            self.custom_interval_item = rumps.MenuItem(
+                "間隔: キャプチャ間隔を指定",
+                callback=self.on_set_custom_interval,
+            )
 
             self.menu = [
                 self.count_item,
@@ -304,8 +306,7 @@ def run_menubar() -> None:
                 self.interval_items[10],
                 self.interval_items[60],
                 self.interval_items[300],
-                self.interval_items[600],
-                self.interval_items[1800],
+                self.custom_interval_item,
                 rumps.MenuItem("除外設定を開く", callback=self.on_open_exclusions),
                 None,
                 rumps.MenuItem("今すぐ1回キャプチャ", callback=self.on_capture_now),
@@ -351,10 +352,7 @@ def run_menubar() -> None:
             if _agent_running():
                 _run_cli(["launchd", "capture", "install"])
             self._sync_interval_menu()
-            if sec < 60:
-                interval_str = f"{sec}秒"
-            else:
-                interval_str = f"{sec // 60}分"
+            interval_str = self._format_interval(sec)
             rumps.notification("everlog", "間隔変更", f"キャプチャ間隔を {interval_str} に変更しました")
 
         def _sync_interval_menu(self):
@@ -362,6 +360,130 @@ def run_menubar() -> None:
             current = cfg.interval_sec
             for sec, item in self.interval_items.items():
                 item.state = 1 if sec == current else 0
+            self.custom_interval_item.state = 1 if current not in self.interval_items else 0
+            self.custom_interval_item.title = (
+                "間隔: キャプチャ間隔を指定"
+                if current in self.interval_items
+                else f"間隔: キャプチャ間隔を指定（現在 {self._format_interval(current)}）"
+            )
+
+        def _format_interval(self, sec: int) -> str:
+            if sec < 60:
+                return f"{sec}秒"
+            minute, second = divmod(sec, 60)
+            if second == 0:
+                return f"{minute}分"
+            return f"{minute}分{second}秒"
+
+        def _prompt_int(self, title: str, message: str, default_value: int) -> int | None:
+            win = rumps.Window(
+                message=message,
+                title=title,
+                default_text=str(default_value),
+                ok="決定",
+                cancel="キャンセル",
+                dimensions=(220, 24),
+            )
+            res = win.run()
+            if not res.clicked:
+                return None
+            value = res.text.strip()
+            if not value.isdigit():
+                rumps.alert("入力エラー", "0以上の整数を入力してください。")
+                return None
+            return int(value)
+
+        def _prompt_interval_single_dialog(self, current_sec: int) -> tuple[bool, int | None]:
+            """
+            Show a native macOS dialog with minute/second fields.
+            Returns (shown, value):
+              - shown=False: native dialog unavailable, caller may fallback.
+              - shown=True and value=None: cancelled or invalid input.
+              - shown=True and value=int: valid interval in seconds.
+            """
+            try:
+                from AppKit import NSAlert, NSAlertFirstButtonReturn, NSMakeRect, NSView, NSTextField
+            except Exception:
+                return (False, None)
+
+            minute_default, second_default = divmod(max(0, int(current_sec)), 60)
+
+            def _make_label(text: str, x: float, y: float, w: float, h: float):
+                label = NSTextField.alloc().initWithFrame_(NSMakeRect(x, y, w, h))
+                label.setStringValue_(text)
+                label.setBezeled_(False)
+                label.setDrawsBackground_(False)
+                label.setEditable_(False)
+                label.setSelectable_(False)
+                return label
+
+            alert = NSAlert.alloc().init()
+            alert.setMessageText_("キャプチャ間隔を指定")
+            alert.setInformativeText_("分・秒を入力してください")
+            alert.addButtonWithTitle_("決定")
+            alert.addButtonWithTitle_("キャンセル")
+
+            accessory = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, 280, 56))
+            minute_label = _make_label("分", 0, 30, 24, 22)
+            minute_field = NSTextField.alloc().initWithFrame_(NSMakeRect(26, 28, 80, 24))
+            minute_field.setStringValue_(str(minute_default))
+            second_label = _make_label("秒", 126, 30, 24, 22)
+            second_field = NSTextField.alloc().initWithFrame_(NSMakeRect(152, 28, 80, 24))
+            second_field.setStringValue_(str(second_default))
+
+            accessory.addSubview_(minute_label)
+            accessory.addSubview_(minute_field)
+            accessory.addSubview_(second_label)
+            accessory.addSubview_(second_field)
+            alert.setAccessoryView_(accessory)
+
+            response = alert.runModal()
+            if response != NSAlertFirstButtonReturn:
+                return (True, None)
+
+            minute_text = str(minute_field.stringValue()).strip()
+            second_text = str(second_field.stringValue()).strip()
+            if not minute_text.isdigit() or not second_text.isdigit():
+                rumps.alert("入力エラー", "分・秒ともに0以上の整数を入力してください。")
+                return (True, None)
+
+            minute = int(minute_text)
+            second = int(second_text)
+            if second > 59:
+                rumps.alert("入力エラー", "秒は0〜59で入力してください。")
+                return (True, None)
+
+            total_sec = minute * 60 + second
+            if total_sec <= 0:
+                rumps.alert("入力エラー", "1秒以上を指定してください。")
+                return (True, None)
+            return (True, total_sec)
+
+        def on_set_custom_interval(self, _):
+            cfg = load_config()
+            shown, total_sec = self._prompt_interval_single_dialog(cfg.interval_sec)
+            if shown:
+                if total_sec is None:
+                    return
+                self._set_interval(total_sec)
+                return
+
+            # Fallback when native dialog is unavailable.
+            cur_min, cur_sec = divmod(max(0, int(cfg.interval_sec)), 60)
+            minute = self._prompt_int("キャプチャ間隔を指定", "分を入力してください（0以上の整数）", cur_min)
+            if minute is None:
+                return
+            second = self._prompt_int("キャプチャ間隔を指定", "秒を入力してください（0〜59の整数）", cur_sec)
+            if second is None:
+                return
+            if second > 59:
+                rumps.alert("入力エラー", "秒は0〜59で入力してください。")
+                return
+            total_sec = minute * 60 + second
+            if total_sec <= 0:
+                rumps.alert("入力エラー", "1秒以上を指定してください。")
+                return
+            self._set_interval(total_sec)
 
         def _sync_autostart_menu(self):
             enabled = _autostart_enabled()

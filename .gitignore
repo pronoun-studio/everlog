@@ -17,3 +17,4 @@ dist/
 # ローカル開発用ログディレクトリ（プロジェクト直下に配置した場合）
 EVERYTIME-LOG/
 .env
+.experiments
