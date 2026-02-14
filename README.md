@@ -105,8 +105,13 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 ./.venv/bin/everlog launchd capture uninstall
 ```
 
-### 3.5) launchd（日次処理: enrich + summarize）
-毎日23:55に `enrich` → `summarize` を自動実行します（`OPENAI_API_KEY` が必要）。
+### 3.5) launchd（日次処理: summarize オーケストレーション）
+毎日23:55に当日分の `summarize` を自動実行します（`OPENAI_API_KEY` が必要）。
+また、起動時（RunAtLoad）に未完了日の再試行を行います。
+
+- 起動時: 未完了の pending 日付 + 昨日分（未生成/未完了なら）を再試行
+- 23:55: pending 日付を先に再試行し、その後に当日分を実行
+- LLM未完了（`⚠️ 未完成...`）の場合は失敗扱いで pending に残り、次回起動時または次回23:55で再実行
 ```sh
 ./.venv/bin/everlog launchd daily install
 ```

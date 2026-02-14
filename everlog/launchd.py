@@ -148,15 +148,16 @@ def _write_plist_capture(interval_sec: int) -> None:
 
 
 def _write_plist_daily() -> None:
-    """毎日23:55に summarize を実行するplistを生成（enrichは任意）"""
+    """日次オーケストレーションを実行するplistを生成する。"""
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     plist = _plist_path(DAILY_LABEL)
     cfg = load_config()
     python = _python_executable()
-    # Default: summarize only. To include enrich, set EVERLOG_RUN_ENRICH=1 and customize your schedule.
-    # EVERLOG_HOURLY_LLM と EVERLOG_DAILY_LLM を有効化してフル機能のMarkdown生成を行う
-    script = f'EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 {python} -m everlog.cli summarize --date today'
+    # Run the daily orchestrator:
+    # - 23:55 regular run: process pending + today
+    # - RunAtLoad run: process pending + yesterday backfill
+    script = f'EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 {python} -m everlog.cli daily-run'
     env_xml = _env_dict_xml()
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -178,6 +179,8 @@ def _write_plist_daily() -> None:
     <key>Minute</key>
     <integer>55</integer>
   </dict>
+  <key>RunAtLoad</key>
+  <true/>
   <key>StandardOutPath</key>
   <string>{Path.home()}/.everlog/daily.out.log</string>
   <key>StandardErrorPath</key>

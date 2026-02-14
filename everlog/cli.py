@@ -8,6 +8,7 @@ import argparse
 import sys
 
 from .capture import run_capture_once
+from .daily_runner import run_daily_automation
 from .enrich import enrich_day_with_llm
 from .launchd import (
     launchd_capture_install,
@@ -43,6 +44,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
 
     p_sum = sub.add_parser("summarize", help="Summarize JSONL into daily Markdown")
     p_sum.add_argument("--date", default="today", help="YYYY-MM-DD or 'today'")
+    sub.add_parser("daily-run", help="Run daily summarize orchestration (pending/yesterday/today)")
 
     p_enrich = sub.add_parser("enrich", help="Enrich JSONL via LLM (writes out/YYYY-MM-DD.llm.json)")
     p_enrich.add_argument("--date", default="today", help="YYYY-MM-DD or 'today'")
@@ -96,6 +98,9 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "summarize":
         summarize_day_to_markdown(args.date)
+        return 0
+    if args.cmd == "daily-run":
+        run_daily_automation()
         return 0
     if args.cmd == "enrich":
         enrich_day_with_llm(args.date, model=args.model, max_segments=args.max_segments)

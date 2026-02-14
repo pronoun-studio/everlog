@@ -12,7 +12,9 @@ import difflib
 import json
 import os
 import re
+import socket
 import time
+from urllib.parse import urlparse
 
 from typing import Callable
 
@@ -659,6 +661,35 @@ def _is_retryable_llm_error(err: LlmError) -> bool:
     return any(tok in msg for tok in retryable_tokens)
 
 
+def _llm_api_host_port() -> tuple[str, int]:
+    base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").strip()
+    if not base:
+        base = "https://api.openai.com/v1"
+    parsed = urlparse(base)
+    host = parsed.hostname or "api.openai.com"
+    if parsed.port:
+        return host, int(parsed.port)
+    if parsed.scheme == "http":
+        return host, 80
+    return host, 443
+
+
+def _llm_network_reachable(timeout_sec: float = 2.0) -> bool:
+    host, port = _llm_api_host_port()
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
+
+
+def _log_llm_retry(stage: str, attempt: int, action: str, detail: str = "") -> None:
+    msg = f"[summarize][{stage}] attempt {attempt}/3 {action}"
+    if detail:
+        msg += f": {detail}"
+    print(msg)
+
+
 def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[str, Any] | None:
     if not _hourly_llm_enabled():
         return None
@@ -692,11 +723,23 @@ def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[s
     for attempt in range(3):
         try:
             res = analyze_hour_blocks(date, payload, model_name, api_key)
+            if attempt > 0:
+                _log_llm_retry("hour-llm", attempt + 1, "succeeded")
             break
         except LlmError as e:
-            if attempt >= 2 or not _is_retryable_llm_error(e):
+            err_msg = str(e)
+            if attempt >= 2:
+                _log_llm_retry("hour-llm", attempt + 1, "stopped", "max attempts reached")
                 return None
-            time.sleep(1.0 + float(attempt))
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry("hour-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry("hour-llm", attempt + 1, "stopped", "network unreachable for retry")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry("hour-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
+            time.sleep(wait_sec)
     if res is None:
         return None
     cost_usd = calc_cost_usd(res.usage, res.model)
@@ -768,11 +811,23 @@ def _maybe_run_daily_llm(
     for attempt in range(3):
         try:
             res = analyze_day_summary(date, hours_in, model_name, api_key)
+            if attempt > 0:
+                _log_llm_retry("daily-llm", attempt + 1, "succeeded")
             break
         except LlmError as e:
-            if attempt >= 2 or not _is_retryable_llm_error(e):
+            err_msg = str(e)
+            if attempt >= 2:
+                _log_llm_retry("daily-llm", attempt + 1, "stopped", "max attempts reached")
                 return None
-            time.sleep(1.0 + float(attempt))
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry("daily-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry("daily-llm", attempt + 1, "stopped", "network unreachable for retry")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry("daily-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
+            time.sleep(wait_sec)
     if res is None:
         return None
     cost_usd = calc_cost_usd(res.usage, res.model)
@@ -865,11 +920,27 @@ def _maybe_run_hour_enrich_llm(
     for attempt in range(3):
         try:
             res = enrich_hours_with_context(date, daily_context, hours_overview, model_name, api_key)
+            if attempt > 0:
+                _log_llm_retry("hour-enrich-llm", attempt + 1, "succeeded")
             break
         except LlmError as e:
-            if attempt >= 2 or not _is_retryable_llm_error(e):
+            err_msg = str(e)
+            if attempt >= 2:
+                _log_llm_retry("hour-enrich-llm", attempt + 1, "stopped", "max attempts reached")
                 return None
-            time.sleep(1.0 + float(attempt))
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry(
+                    "hour-enrich-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})"
+                )
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry("hour-enrich-llm", attempt + 1, "stopped", "network unreachable for retry")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry(
+                "hour-enrich-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})"
+            )
+            time.sleep(wait_sec)
     if res is None:
         return None
 
