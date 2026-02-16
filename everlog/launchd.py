@@ -157,7 +157,10 @@ def _write_plist_daily() -> None:
     # Run the daily orchestrator:
     # - 23:55 regular run: process pending + today
     # - RunAtLoad run: process pending + yesterday backfill
-    script = f'EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 {python} -m everlog.cli daily-run'
+    script = (
+        f"EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 EVERLOG_HOUR_ENRICH_LLM=1 "
+        f"EVERLOG_LLM_TIMEOUT_SEC=300 {python} -m everlog.cli daily-run"
+    )
     env_xml = _env_dict_xml()
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

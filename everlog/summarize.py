@@ -661,6 +661,20 @@ def _is_retryable_llm_error(err: LlmError) -> bool:
     return any(tok in msg for tok in retryable_tokens)
 
 
+def _llm_timeout_sec() -> int:
+    raw = (
+        os.environ.get("EVERLOG_LLM_TIMEOUT_SEC")
+        or os.environ.get("EVERYTIMECAPTURE_LLM_TIMEOUT_SEC")
+        or ""
+    ).strip()
+    try:
+        timeout = int(raw) if raw else 180
+    except Exception:
+        timeout = 180
+    # Keep a sane lower bound to avoid too aggressive timeouts.
+    return max(30, timeout)
+
+
 def _llm_api_host_port() -> tuple[str, int]:
     base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").strip()
     if not base:
@@ -722,7 +736,13 @@ def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[s
     res = None
     for attempt in range(3):
         try:
-            res = analyze_hour_blocks(date, payload, model_name, api_key)
+            res = analyze_hour_blocks(
+                date,
+                payload,
+                model_name,
+                api_key,
+                timeout_sec=_llm_timeout_sec(),
+            )
             if attempt > 0:
                 _log_llm_retry("hour-llm", attempt + 1, "succeeded")
             break
@@ -810,7 +830,13 @@ def _maybe_run_daily_llm(
     res = None
     for attempt in range(3):
         try:
-            res = analyze_day_summary(date, hours_in, model_name, api_key)
+            res = analyze_day_summary(
+                date,
+                hours_in,
+                model_name,
+                api_key,
+                timeout_sec=_llm_timeout_sec(),
+            )
             if attempt > 0:
                 _log_llm_retry("daily-llm", attempt + 1, "succeeded")
             break
@@ -919,7 +945,14 @@ def _maybe_run_hour_enrich_llm(
     res = None
     for attempt in range(3):
         try:
-            res = enrich_hours_with_context(date, daily_context, hours_overview, model_name, api_key)
+            res = enrich_hours_with_context(
+                date,
+                daily_context,
+                hours_overview,
+                model_name,
+                api_key,
+                timeout_sec=_llm_timeout_sec(),
+            )
             if attempt > 0:
                 _log_llm_retry("hour-enrich-llm", attempt + 1, "succeeded")
             break

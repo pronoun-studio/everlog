@@ -111,7 +111,8 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 
 - 起動時: 未完了の pending 日付 + 昨日分（未生成/未完了なら）を再試行
 - 23:55: pending 日付を先に再試行し、その後に当日分を実行
-- LLM未完了（`⚠️ 未完成...`）の場合は失敗扱いで pending に残り、次回起動時または次回23:55で再実行
+- LLM未完了（`⚠️ 未完成...` や `hour/daily/hour-enrich` のいずれか未実行）の場合は失敗扱いで pending に残り、次回起動時または次回23:55で再実行
+- 日次自動実行では `EVERLOG_LLM_TIMEOUT_SEC=300` を設定し、ネットワーク遅延時のタイムアウトを緩和
 ```sh
 ./.venv/bin/everlog launchd daily install
 ```

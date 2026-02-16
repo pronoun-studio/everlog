@@ -11,6 +11,9 @@ from .summarize import summarize_day_to_markdown
 
 
 _INCOMPLETE_MARKER = "⚠️ 未完成: 1時間LLM要約が無効/失敗のため、タイムラインは不完全です。"
+_HOUR_MISSING_MARKER = "  - hour-llm（タイムライン用）: 未実行"
+_DAILY_MISSING_MARKER = "  - daily-llm（総括用）: 未実行"
+_HOUR_ENRICH_MISSING_MARKER = "  - hour-enrich-llm（目的・意味付け）: 未実行"
 
 
 @dataclass
@@ -99,7 +102,16 @@ def _is_summary_complete_for_date(date: str) -> bool:
         text = md.read_text(encoding="utf-8")
     except Exception:
         return False
-    return _INCOMPLETE_MARKER not in text
+    if _INCOMPLETE_MARKER in text:
+        return False
+    # Treat missing LLM stages as incomplete so daily automation retries later.
+    if _HOUR_MISSING_MARKER in text:
+        return False
+    if _DAILY_MISSING_MARKER in text:
+        return False
+    if _HOUR_ENRICH_MISSING_MARKER in text:
+        return False
+    return True
 
 
 def _mark_pending(items: dict[str, PendingItem], date: str, reason: str) -> None:
@@ -118,6 +130,21 @@ def _clear_pending(items: dict[str, PendingItem], date: str) -> None:
     if date in items:
         del items[date]
         print(f"[daily] Cleared pending: {date}")
+
+
+def _llm_incomplete_reason_from_markdown(text: str) -> str:
+    reasons: list[str] = []
+    if _INCOMPLETE_MARKER in text:
+        reasons.append("hour-llm missing")
+    if _HOUR_MISSING_MARKER in text:
+        reasons.append("hour-llm usage missing")
+    if _DAILY_MISSING_MARKER in text:
+        reasons.append("daily-llm usage missing")
+    if _HOUR_ENRICH_MISSING_MARKER in text:
+        reasons.append("hour-enrich-llm usage missing")
+    if not reasons:
+        return ""
+    return ", ".join(reasons)
 
 
 def _should_run_today(now: datetime) -> bool:
@@ -176,8 +203,9 @@ def run_daily_automation() -> int:
                 text = out_path.read_text(encoding="utf-8")
             except Exception:
                 text = ""
-            if _INCOMPLETE_MARKER in text:
-                _mark_pending(pending, date, "LLM incomplete (hour-llm missing)")
+            incomplete_reason = _llm_incomplete_reason_from_markdown(text)
+            if incomplete_reason:
+                _mark_pending(pending, date, f"LLM incomplete ({incomplete_reason})")
             else:
                 print(f"[daily] Summarize succeeded: {date}")
                 _clear_pending(pending, date)
