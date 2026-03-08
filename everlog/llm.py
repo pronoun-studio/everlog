@@ -170,38 +170,39 @@ def _extract_output_text(responses_payload: dict[str, Any]) -> str:
 
 
 # enrich処理で2026年2月7日現在使っていない
-def _build_user_prompt(date: str, segments: list[dict[str, Any]]) -> str:
-    payload = json.dumps({"date": date, "segments": segments}, ensure_ascii=False, indent=2)
-    return (
-        "あなたはPC作業ログの解析者です。以下のセグメント一覧から、各セグメントに"
-        "「task_title」「task_summary」「category」「confidence」を付与してください。\n"
-        "\n"
-        "重要: 具体性を最優先にしてください。入力には `keywords` / `ocr_snippets` / `domain` / `window_title` が含まれます。\n"
-        "- `task_title` は短く具体的（例:「OpenAIのAPI keys画面を確認」「everlog.appをターミナルから起動してログ確認」「GitHubでpronoun-studio/parameter-coinを閲覧」）。\n"
-        "- `task_summary` は日本語1〜2文。必ず「何を」見た/操作したかを、ファイル名・ディレクトリ・URL・画面名など具体的なアンカーで最低1つ入れる。\n"
-        "- 「データ探索」「情報参照」「短時間作業」「ファイル確認」だけの抽象表現で終わらせない（具体アンカー無しは禁止）。\n"
-        "- 推測は控えめに（根拠が `keywords` / `ocr_snippets` / `window_title` にある範囲で）。\n"
-        "- 安全/プライバシー: 個人情報（氏名/住所/電話/メール等）や認証情報（パスワード/OTP/秘密鍵/トークン等）を出さない。\n"
-        "- 安全/コンプライアンス: アダルト/自傷/犯罪・危険行為の具体（手順・再現性のある説明）は出さない。\n"
-        "- もし入力に該当内容が含まれても、具体文字列は出さず `[REDACTED_SENSITIVE]` に置換し、高レベルに言い換える（例:「認証画面の確認」「センシティブな内容の閲覧」）。\n"
-        "- 既に `[REDACTED_*]` があればそれを尊重。\n"
-        "\n"
-        "必ずJSONのみを返してください。category は [dev, meeting, research, writing, admin, other] から選ぶ。\n\n"
-        "出力JSONの形式:\n"
-        "{\n"
-        '  "segments": [\n'
-        "    {\n"
-        '      "segment_id": 0,\n'
-        '      "task_title": "短い作業名",\n'
-        '      "task_summary": "1-2文の要約",\n'
-        '      "category": "dev",\n'
-        '      "confidence": 0.0\n'
-        "    }\n"
-        "  ]\n"
-        "}\n\n"
-        "入力:\n"
-        f"{payload}\n"
-    )
+
+# def _build_user_prompt(date: str, segments: list[dict[str, Any]]) -> str:
+#     payload = json.dumps({"date": date, "segments": segments}, ensure_ascii=False, indent=2)
+#     return (
+#         "あなたはPC作業ログの解析者です。以下のセグメント一覧から、各セグメントに"
+#         "「task_title」「task_summary」「category」「confidence」を付与してください。\n"
+#         "\n"
+#         "重要: 具体性を最優先にしてください。入力には `keywords` / `ocr_snippets` / `domain` / `window_title` が含まれます。\n"
+#         "- `task_title` は短く具体的（例:「OpenAIのAPI keys画面を確認」「everlog.appをターミナルから起動してログ確認」「GitHubでpronoun-studio/parameter-coinを閲覧」）。\n"
+#         "- `task_summary` は日本語1〜2文。必ず「何を」見た/操作したかを、ファイル名・ディレクトリ・URL・画面名など具体的なアンカーで最低1つ入れる。\n"
+#         "- 「データ探索」「情報参照」「短時間作業」「ファイル確認」だけの抽象表現で終わらせない（具体アンカー無しは禁止）。\n"
+#         "- 推測は控えめに（根拠が `keywords` / `ocr_snippets` / `window_title` にある範囲で）。\n"
+#         "- 安全/プライバシー: 個人情報（氏名/住所/電話/メール等）や認証情報（パスワード/OTP/秘密鍵/トークン等）を出さない。\n"
+#         "- 安全/コンプライアンス: アダルト/自傷/犯罪・危険行為の具体（手順・再現性のある説明）は出さない。\n"
+#         "- もし入力に該当内容が含まれても、具体文字列は出さず `[REDACTED_SENSITIVE]` に置換し、高レベルに言い換える（例:「認証画面の確認」「センシティブな内容の閲覧」）。\n"
+#         "- 既に `[REDACTED_*]` があればそれを尊重。\n"
+#         "\n"
+#         "必ずJSONのみを返してください。category は [dev, meeting, research, writing, admin, other] から選ぶ。\n\n"
+#         "出力JSONの形式:\n"
+#         "{\n"
+#         '  "segments": [\n'
+#         "    {\n"
+#         '      "segment_id": 0,\n'
+#         '      "task_title": "短い作業名",\n'
+#         '      "task_summary": "1-2文の要約",\n'
+#         '      "category": "dev",\n'
+#         '      "confidence": 0.0\n'
+#         "    }\n"
+#         "  ]\n"
+#         "}\n\n"
+#         "入力:\n"
+#         f"{payload}\n"
+#     )
 
 
 def _build_hourly_user_prompt(date: str, hours: list[dict[str, Any]]) -> str:
@@ -211,14 +212,12 @@ def _build_hourly_user_prompt(date: str, hours: list[dict[str, Any]]) -> str:
         "「hour_title」「hour_summary」「confidence」を付与してください。\n"
         "\n"
         "重要: 出力は「ツール列挙」ではなく「行動/目的ベース」にする（アプリ名の羅列だけは禁止）。\n"
-        "重要: 本文は自然文を優先し、URL/パス/ファイル名の羅列は禁止。\n"
         "重要: 入力の `clusters[].active_timeline` が主入力（最優先）、`hour_common_texts` は閲覧画面/背景情報として参照する（主役にしない）。\n"
         "重要: Markdown のタグ（例: `<details>`）や「根拠（OCR/URL/パス）」のような根拠ブロックを **生成しない**。\n"
         "補足: `active_timeline` は ts 順の差分OCRで、`segment_key` は作業文脈のヒント。\n"
         "\n"
-        "- hour_title: 短く具体的（可能なら「〜を〜する」など行動+目的）。アプリ名だけは禁止\n"
-        "- hour_summary: 日本語2〜3文。必ず「アクティブ画面で何を見ながら/操作しながら、何を進めていたか」を中心に書く。URL/パスの列挙は禁止\n"
-        "- 推測は書かない（この工程は短く、観測ベースでまとめる）\n"
+        "- hour_title: 短く具体的。必ず「行動 + 対象 + 目的」を含める（例:『料金表を確認してコスト見積りを整理』）\n"
+        "- hour_summary: 日本語2〜3文。具体アンカー（画面名/ファイル名/キーワード等）を1つ入れて、見ながら/操作しながら何を進めたか:\n"
         "- 安全/プライバシー: 個人情報（氏名/住所/電話/メール等）や認証情報（パスワード/OTP/秘密鍵/トークン等）を出さない。\n"
         "- 安全/コンプライアンス: アダルト/自傷/犯罪・危険行為の具体（手順・再現性のある説明）は出さない。\n"
         "- もし入力に該当内容が含まれても、具体文字列は出さず `[REDACTED_SENSITIVE]` に置換し、高レベルに言い換える（例:「認証画面の確認」「センシティブな内容の閲覧」）。\n"
@@ -248,14 +247,13 @@ def _build_daily_user_prompt(date: str, hours: list[dict[str, Any]]) -> str:
         "あなたはPC作業ログの解析者です。以下の1時間要約（hours）を踏まえて、1日全体の総括を作ってください。\n"
         "\n"
         "重要: 1日の総括は、hoursを全部俯瞰して「何をやった日か」を自然文でまとめる。\n"
-        "- daily_title: 短く具体的（行動+目的）。アプリ名だけは禁止\n"
-        "- daily_summary: 2〜3文。今日の主目的と流れを要約（断定寄りでよい）\n"
-        "- daily_detail: 4〜6文。時系列の大きな流れ→山場→結果/次の課題。推測は **1つだけ**（\"推測:\" を1回だけ）\n"
-        "- highlights: 箇条書きの短文（3〜6個）。成果/進捗/意思決定を中心に\n"
-        "- evidence: 根拠の短いアンカー（最大10）。URL/パスの羅列は避け、短いフレーズで\n"
-        "- 安全/プライバシー: 個人情報（氏名/住所/電話/メール等）や認証情報（パスワード/OTP/秘密鍵/トークン等）を出さない。\n"
-        "- 安全/コンプライアンス: アダルト/自傷/犯罪・危険行為の具体（手順・再現性のある説明）は出さない。\n"
-        "- もし入力に該当内容が含まれても、具体文字列は出さず `[REDACTED_SENSITIVE]` に置換し、高レベルに言い換える。\n"
+        "- daily_title: highlightsの3つの内容を短く具体的にまとめる。「xxxとxxxとxxxの日」のような形式で3つ並べて表示する。\n"
+        "- daily_summary: 3文固定。\n"
+        "  1文目: 今日の主目的（断定）\n"
+        "  2文目: 進捗/判断/比較/修正のいずれかを、具体名詞2つ以上＋短いアンカー1つで述べる\n"
+        "  3文目: 次のアクション（〜する/〜を進める）\n"
+        "- daily_detail: 4〜6文。時系列の大きな流れ→山場→結果。推測も取り入れる\n"
+        "- highlights: 1時間要約のうち長時間やっている作業TOP3を抜粋して箇条書きの短文で3つ掲載。\n"
         "\n"
         "必ずJSONのみを返してください。\n\n"
         "出力JSONの形式:\n"
@@ -306,8 +304,6 @@ def _build_hour_enrich_prompt(
         "- 1日の行動の概要（daily_title/daily_summary）を踏まえて行動の意味を解釈すること\n"
         "- 前の時間帯の作業が次の時間帯の準備になっている場合は、その関係を明示すること\n"
         "- `hour_summary` の言い換えは禁止。観測の再説明ではなく、目的と意味の解釈を書くこと\n"
-        "- アプリ名の羅列は禁止。行動・目的ベースで書くこと\n"
-        "- URL/パスの列挙は禁止\n"
         "- 安全/プライバシー: 個人情報（氏名/住所/電話/メール等）や認証情報（パスワード/OTP/秘密鍵/トークン等）を出さない\n"
         "- 安全/コンプライアンス: アダルト/自傷/犯罪・危険行為の具体（手順・再現性のある説明）は出さない\n"
         "- もし入力に該当内容が含まれても、具体文字列は出さず `[REDACTED_SENSITIVE]` に置換し、高レベルに言い換える\n"

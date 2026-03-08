@@ -697,24 +697,133 @@ def _llm_network_reachable(timeout_sec: float = 2.0) -> bool:
         return False
 
 
+_PIPELINE_LOG_PATH: Path | None = None
+
+
+def _init_pipeline_log(out_dir: Path) -> None:
+    """Set the pipeline log path for the current run."""
+    global _PIPELINE_LOG_PATH
+    _PIPELINE_LOG_PATH = out_dir / "pipeline.log"
+
+
+def _pipeline_log(stage: str, message: str, **kv: Any) -> None:
+    """Write a structured diagnostic line to pipeline.log and stdout."""
+    ts = datetime.now().astimezone().strftime("%H:%M:%S")
+    parts = [f"[{ts}][{stage}] {message}"]
+    for k, v in kv.items():
+        parts.append(f"  {k}={v}")
+    line = "\n".join(parts)
+    print(line)
+    if _PIPELINE_LOG_PATH is not None:
+        try:
+            with open(_PIPELINE_LOG_PATH, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
+
+
 def _log_llm_retry(stage: str, attempt: int, action: str, detail: str = "") -> None:
-    msg = f"[summarize][{stage}] attempt {attempt}/3 {action}"
+    msg = f"attempt {attempt}/3 {action}"
     if detail:
         msg += f": {detail}"
-    print(msg)
+    _pipeline_log(stage, msg)
+    # keep legacy stdout format too
+    print(f"[summarize][{stage}] attempt {attempt}/3 {action}" + (f": {detail}" if detail else ""))
+
+
+def _hourly_llm_batch_size() -> int:
+    raw = os.environ.get("EVERLOG_HOURLY_LLM_BATCH_SIZE") or os.environ.get(
+        "EVERYTIMECAPTURE_HOURLY_LLM_BATCH_SIZE"
+    )
+    try:
+        v = int(raw) if raw is not None else 6
+    except Exception:
+        v = 6
+    return max(1, v)
+
+
+def _merge_llm_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
+    """Merge multiple LLM usage dicts by summing token counts."""
+    total: dict[str, Any] = {}
+    for u in usages:
+        for key in ("input_tokens", "output_tokens", "total_tokens"):
+            total[key] = total.get(key, 0) + int(u.get(key) or 0)
+        inp_detail = u.get("input_tokens_details")
+        if isinstance(inp_detail, dict):
+            td = total.setdefault("input_tokens_details", {})
+            for k, v in inp_detail.items():
+                td[k] = td.get(k, 0) + int(v or 0)
+        out_detail = u.get("output_tokens_details")
+        if isinstance(out_detail, dict):
+            td = total.setdefault("output_tokens_details", {})
+            for k, v in out_detail.items():
+                td[k] = td.get(k, 0) + int(v or 0)
+    return total
+
+
+def _call_hourly_llm_batch(
+    date: str,
+    batch: list[dict[str, Any]],
+    model_name: str,
+    api_key: str,
+    timeout_sec: int,
+    batch_idx: int,
+    batch_total: int,
+) -> LlmResult | None:
+    """Call analyze_hour_blocks for a single batch with retries."""
+    tag = f"hour-llm batch {batch_idx + 1}/{batch_total}"
+    res = None
+    for attempt in range(3):
+        try:
+            _pipeline_log(tag, f"API call attempt {attempt + 1}/3")
+            res = analyze_hour_blocks(
+                date,
+                batch,
+                model_name,
+                api_key,
+                timeout_sec=timeout_sec,
+            )
+            _pipeline_log(tag, f"API call succeeded (attempt {attempt + 1})", usage=res.usage)
+            if attempt > 0:
+                _log_llm_retry(tag, attempt + 1, "succeeded")
+            return res
+        except LlmError as e:
+            err_msg = str(e)
+            _pipeline_log(tag, f"API call FAILED (attempt {attempt + 1})", error=err_msg)
+            if attempt >= 2:
+                _log_llm_retry(tag, attempt + 1, "stopped", "max attempts reached")
+                _pipeline_log(tag, "FAIL: max retry attempts reached")
+                return None
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry(tag, attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                _pipeline_log(tag, "FAIL: non-retryable error", error=err_msg)
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry(tag, attempt + 1, "stopped", "network unreachable for retry")
+                _pipeline_log(tag, "FAIL: network unreachable, aborting retry")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry(tag, attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
+            time.sleep(wait_sec)
+    return None
 
 
 def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[str, Any] | None:
+    _pipeline_log("hour-llm", "enter", hour_packs_count=len(hour_packs))
     if not _hourly_llm_enabled():
+        _pipeline_log("hour-llm", "SKIP: not enabled (EVERLOG_HOURLY_LLM is not set)")
         return None
     min_sec = _hourly_llm_min_sec()
     max_hours = _hourly_llm_max_hours()
 
     eligible = [h for h in hour_packs if int(h.get("active_sec_est") or 0) >= min_sec]
+    _pipeline_log("hour-llm", "eligible filter done", min_sec=min_sec, eligible=len(eligible), total=len(hour_packs))
     if not eligible:
+        _pipeline_log("hour-llm", "SKIP: no eligible hours (all active_sec_est < min_sec)")
         return None
 
     if max_hours > 0 and len(eligible) > max_hours:
+        _pipeline_log("hour-llm", f"trimming eligible from {len(eligible)} to max_hours={max_hours}")
         eligible = sorted(
             eligible,
             key=lambda h: (-(int(h.get("active_sec_est") or 0)), str(h.get("hour_start_ts") or "")),
@@ -729,48 +838,68 @@ def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[s
         or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL")
         or "gpt-5-nano"
     )
+    timeout_sec = _llm_timeout_sec()
+    batch_size = _hourly_llm_batch_size()
+    _pipeline_log("hour-llm", "config",
+                  model=model_name, api_key_set=bool(api_key),
+                  timeout_sec=timeout_sec, batch_size=batch_size)
+
     payload = _build_hourly_llm_input(eligible)
     if not payload:
+        _pipeline_log("hour-llm", "SKIP: _build_hourly_llm_input returned empty payload", eligible_count=len(eligible))
         return None
-    # Retry transient API/network failures so one flaky call does not disable timeline LLM.
-    res = None
-    for attempt in range(3):
-        try:
-            res = analyze_hour_blocks(
-                date,
-                payload,
-                model_name,
-                api_key,
-                timeout_sec=_llm_timeout_sec(),
-            )
-            if attempt > 0:
-                _log_llm_retry("hour-llm", attempt + 1, "succeeded")
-            break
-        except LlmError as e:
-            err_msg = str(e)
-            if attempt >= 2:
-                _log_llm_retry("hour-llm", attempt + 1, "stopped", "max attempts reached")
-                return None
-            if not _is_retryable_llm_error(e):
-                _log_llm_retry("hour-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})")
-                return None
-            if not _llm_network_reachable():
-                _log_llm_retry("hour-llm", attempt + 1, "stopped", "network unreachable for retry")
-                return None
-            wait_sec = 1.0 + float(attempt)
-            _log_llm_retry("hour-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
-            time.sleep(wait_sec)
-    if res is None:
+    payload_json_len = len(json.dumps(payload, ensure_ascii=False))
+    _pipeline_log("hour-llm", "payload built", payload_hours=len(payload), payload_json_chars=payload_json_len)
+
+    # Split payload into batches
+    batches: list[list[dict[str, Any]]] = []
+    for i in range(0, len(payload), batch_size):
+        batches.append(payload[i : i + batch_size])
+    _pipeline_log("hour-llm", f"split into {len(batches)} batch(es)",
+                  sizes=[len(b) for b in batches])
+
+    all_hours: list[dict[str, Any]] = []
+    all_usages: list[dict[str, Any]] = []
+    model_used = model_name
+    failed_batches = 0
+
+    for bi, batch in enumerate(batches):
+        batch_json_len = len(json.dumps(batch, ensure_ascii=False))
+        _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} start",
+                      hours=len(batch), json_chars=batch_json_len)
+        res = _call_hourly_llm_batch(
+            date, batch, model_name, api_key, timeout_sec,
+            batch_idx=bi, batch_total=len(batches),
+        )
+        if res is not None:
+            batch_hours = res.data.get("hours") or []
+            all_hours.extend(batch_hours)
+            all_usages.append(res.usage)
+            model_used = res.model
+            _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} done",
+                          result_hours=len(batch_hours))
+        else:
+            failed_batches += 1
+            _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} FAILED")
+
+    if not all_hours:
+        _pipeline_log("hour-llm", "FAIL: all batches returned no hours",
+                      failed_batches=failed_batches, total_batches=len(batches))
         return None
-    cost_usd = calc_cost_usd(res.usage, res.model)
+
+    merged_usage = _merge_llm_usage(all_usages) if all_usages else {}
+    cost_usd = calc_cost_usd(merged_usage, model_used)
+    _pipeline_log("hour-llm", "all batches complete",
+                  total_hours=len(all_hours), failed_batches=failed_batches,
+                  merged_usage=merged_usage, cost_usd=cost_usd)
     return {
         "date": date,
-        "model": res.model,
+        "model": model_used,
         "generated_at": datetime.now().astimezone().isoformat(),
-        "hour_count": len(payload),
-        "usage": res.usage,
+        "hour_count": len(all_hours),
+        "usage": merged_usage,
         "cost_usd": cost_usd,
-        "hours": res.data.get("hours") or [],
+        "hours": all_hours,
     }
 
 
@@ -781,12 +910,14 @@ def _maybe_run_daily_llm(
     hourly_llm_map: dict[str, dict[str, Any]],
     run_id: str,
 ) -> dict[str, Any] | None:
+    _pipeline_log("daily-llm", "enter", hour_packs=len(hour_packs), hourly_llm_map_keys=len(hourly_llm_map))
     if not _daily_llm_enabled():
+        _pipeline_log("daily-llm", "SKIP: not enabled")
         return None
     if not hour_packs:
+        _pipeline_log("daily-llm", "SKIP: no hour_packs")
         return None
 
-    # Build a compact per-hour list (one row per hour) to summarize the whole day.
     hours_in: list[dict[str, Any]] = []
     for h in hour_packs:
         hour_key = str(h.get("hour_start_ts") or "").strip()
@@ -814,6 +945,7 @@ def _maybe_run_daily_llm(
         )
 
     if not hours_in:
+        _pipeline_log("daily-llm", "SKIP: hours_in is empty after filtering")
         return None
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
@@ -826,6 +958,7 @@ def _maybe_run_daily_llm(
         or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL")
         or "gpt-5-nano"
     )
+    _pipeline_log("daily-llm", "calling API", model=model_name, hours_in_count=len(hours_in), api_key_set=bool(api_key))
 
     res = None
     for attempt in range(3):
@@ -837,24 +970,30 @@ def _maybe_run_daily_llm(
                 api_key,
                 timeout_sec=_llm_timeout_sec(),
             )
+            _pipeline_log("daily-llm", f"API call succeeded (attempt {attempt + 1})", model=res.model, usage=res.usage)
             if attempt > 0:
                 _log_llm_retry("daily-llm", attempt + 1, "succeeded")
             break
         except LlmError as e:
             err_msg = str(e)
+            _pipeline_log("daily-llm", f"API call FAILED (attempt {attempt + 1})", error=err_msg)
             if attempt >= 2:
                 _log_llm_retry("daily-llm", attempt + 1, "stopped", "max attempts reached")
+                _pipeline_log("daily-llm", "FAIL: max retry attempts reached")
                 return None
             if not _is_retryable_llm_error(e):
                 _log_llm_retry("daily-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                _pipeline_log("daily-llm", "FAIL: non-retryable error", error=err_msg)
                 return None
             if not _llm_network_reachable():
                 _log_llm_retry("daily-llm", attempt + 1, "stopped", "network unreachable for retry")
+                _pipeline_log("daily-llm", "FAIL: network unreachable")
                 return None
             wait_sec = 1.0 + float(attempt)
             _log_llm_retry("daily-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
             time.sleep(wait_sec)
     if res is None:
+        _pipeline_log("daily-llm", "FAIL: res is None after retry loop (unexpected)")
         return None
     cost_usd = calc_cost_usd(res.usage, res.model)
     data = res.data if isinstance(res.data, dict) else {}
@@ -882,11 +1021,15 @@ def _maybe_run_hour_enrich_llm(
     daily contextを踏まえて各時間帯の目的・意味を再解釈する。
     daily_llm と hourly_llm_map が必要。
     """
+    _pipeline_log("hour-enrich", "enter", daily_llm_present=bool(daily_llm), hourly_map_keys=len(hourly_llm_map))
     if not _hour_enrich_llm_enabled():
+        _pipeline_log("hour-enrich", "SKIP: not enabled")
         return None
     if not daily_llm:
+        _pipeline_log("hour-enrich", "SKIP: no daily_llm")
         return None
     if not hourly_llm_map:
+        _pipeline_log("hour-enrich", "SKIP: no hourly_llm_map (hour-llm likely failed)")
         return None
 
     # daily context を抽出
@@ -1382,6 +1525,14 @@ def summarize_day_to_markdown(
     out_dir = p.out_dir / date / output_run_id
     out_dir.mkdir(parents=True, exist_ok=True)
     # NOTE: out/<date>.md への「latest」コピーは廃止。常に out/<date>/<run_id>/ に格納する。
+    _init_pipeline_log(out_dir)
+    _pipeline_log("pipeline", f"start summarize_day_to_markdown date={date} run_id={output_run_id}")
+    _pipeline_log("pipeline", "env check",
+                  EVERLOG_HOURLY_LLM=os.environ.get("EVERLOG_HOURLY_LLM", "(unset)"),
+                  EVERLOG_DAILY_LLM=os.environ.get("EVERLOG_DAILY_LLM", "(unset)"),
+                  EVERLOG_HOUR_ENRICH_LLM=os.environ.get("EVERLOG_HOUR_ENRICH_LLM", "(unset)"),
+                  OPENAI_API_KEY_set=bool(os.environ.get("OPENAI_API_KEY")),
+                  EVERLOG_LLM_MODEL=os.environ.get("EVERLOG_LLM_MODEL", "(unset)"))
 
     _progress(0, "stage-00: ログ読込中")
     events = read_jsonl(log_path)
@@ -1452,20 +1603,37 @@ def summarize_day_to_markdown(
     hourly_llm_required = _hourly_llm_enabled()
     hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
     hourly_llm_meta = _load_hourly_llm_meta(date, run_id=output_run_id)
+    _pipeline_log("stage-05", "check",
+                  hourly_llm_required=hourly_llm_required,
+                  cached_map_keys=len(hourly_llm_map),
+                  hour_packs_count=len(hour_packs))
     if hourly_llm_required and not hourly_llm_map:
         _progress(50, "stage-05: hour-llm 実行中")
+        _pipeline_log("stage-05", "no cache, calling _maybe_run_hourly_llm")
         hourly_out = _maybe_run_hourly_llm(date, hour_packs)
         if hourly_out:
+            _pipeline_log("stage-05", "hour-llm returned result, saving", hours=len(hourly_out.get("hours") or []))
             _hourly_llm_path(date, run_id=output_run_id).write_text(
                 json.dumps(hourly_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
             hourly_llm_meta = _load_hourly_llm_meta(date, run_id=output_run_id)
+        else:
+            _pipeline_log("stage-05", "FAIL: _maybe_run_hourly_llm returned None")
+    elif hourly_llm_required and hourly_llm_map:
+        _pipeline_log("stage-05", "using cached hourly_llm_map", keys=len(hourly_llm_map))
     hourly_llm_missing = bool(hourly_llm_required and hour_packs and not hourly_llm_map)
+    if hourly_llm_missing:
+        _pipeline_log("stage-05", "WARNING: hourly_llm_missing=True, ⚠️ marker will appear in markdown")
 
     daily_llm = _load_daily_llm(date, run_id=output_run_id)
+    _pipeline_log("stage-06", "check",
+                  daily_llm_enabled=_daily_llm_enabled(),
+                  cached=bool(daily_llm),
+                  hour_packs_count=len(hour_packs))
     if _daily_llm_enabled() and not daily_llm and hour_packs:
         _progress(70, "stage-06: daily-llm 実行中")
+        _pipeline_log("stage-06", "no cache, calling _maybe_run_daily_llm")
         daily_out = _maybe_run_daily_llm(
             date,
             hour_packs=hour_packs,
@@ -1473,15 +1641,22 @@ def summarize_day_to_markdown(
             run_id=output_run_id,
         )
         if daily_out:
+            _pipeline_log("stage-06", "daily-llm returned result, saving")
             _daily_llm_path(date, run_id=output_run_id).write_text(
                 json.dumps(daily_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             daily_llm = _load_daily_llm(date, run_id=output_run_id)
+        else:
+            _pipeline_log("stage-06", "FAIL: _maybe_run_daily_llm returned None")
 
     # hour-enrich LLM: daily contextを踏まえて各時間帯の目的・意味を再解釈
     hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
     hour_enrich_llm_meta: dict[str, Any] = {}
-    # If cache exists, load meta (usage/model) too so the markdown "LLM使用量" shows correct status.
+    _pipeline_log("stage-07", "check",
+                  hour_enrich_enabled=_hour_enrich_llm_enabled(),
+                  cached_map_keys=len(hour_enrich_llm_map),
+                  daily_llm_present=bool(daily_llm),
+                  hourly_llm_map_keys=len(hourly_llm_map))
     if _hour_enrich_llm_enabled() and hour_enrich_llm_map:
         try:
             meta = _load_hour_enrich_llm(date, run_id=output_run_id)
@@ -1491,6 +1666,7 @@ def summarize_day_to_markdown(
             hour_enrich_llm_meta = {}
     if _hour_enrich_llm_enabled() and not hour_enrich_llm_map and daily_llm and hourly_llm_map:
         _progress(85, "stage-07: hour-enrich-llm 実行中")
+        _pipeline_log("stage-07", "no cache, calling _maybe_run_hour_enrich_llm")
         hour_enrich_out = _maybe_run_hour_enrich_llm(
             date,
             daily_llm=daily_llm,
@@ -1499,11 +1675,17 @@ def summarize_day_to_markdown(
             run_id=output_run_id,
         )
         if hour_enrich_out:
+            _pipeline_log("stage-07", "hour-enrich returned result, saving")
             _hour_enrich_llm_path(date, run_id=output_run_id).write_text(
                 json.dumps(hour_enrich_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
             )
             hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
             hour_enrich_llm_meta = _load_hour_enrich_llm(date, run_id=output_run_id)
+        else:
+            _pipeline_log("stage-07", "FAIL: _maybe_run_hour_enrich_llm returned None")
+    elif _hour_enrich_llm_enabled() and not hour_enrich_llm_map:
+        _pipeline_log("stage-07", "SKIP: prerequisites not met",
+                      daily_llm_present=bool(daily_llm), hourly_llm_map_keys=len(hourly_llm_map))
 
     # 集計（メイン作業）: LLMの task_title があればそれを優先
     by_task_sec: Counter[str] = Counter()
@@ -1870,5 +2052,10 @@ def summarize_day_to_markdown(
         daily_llm_path = _daily_llm_path(date, run_id=output_run_id)
         sync_daily(date, output_run_id, out_path, daily_llm_path)
 
+    _pipeline_log("pipeline", "finished",
+                  hourly_llm_missing=hourly_llm_missing,
+                  daily_llm_present=bool(daily_llm),
+                  hour_enrich_present=bool(hour_enrich_llm_map),
+                  output=str(out_path))
     _progress(100, "完了")
     return out_path

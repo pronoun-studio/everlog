@@ -293,6 +293,14 @@ def run_menubar() -> None:
                 "間隔: キャプチャ間隔を指定",
                 callback=self.on_set_custom_interval,
             )
+            self.capture_mode_active_item = rumps.MenuItem(
+                "取得範囲: アクティブ画面のみ",
+                callback=lambda _: self._set_capture_mode("active_only"),
+            )
+            self.capture_mode_all_item = rumps.MenuItem(
+                "取得範囲: 全画面（旧仕様）",
+                callback=lambda _: self._set_capture_mode("all_displays"),
+            )
 
             self.menu = [
                 self.count_item,
@@ -307,6 +315,9 @@ def run_menubar() -> None:
                 self.interval_items[60],
                 self.interval_items[300],
                 self.custom_interval_item,
+                None,
+                self.capture_mode_active_item,
+                self.capture_mode_all_item,
                 rumps.MenuItem("除外設定を開く", callback=self.on_open_exclusions),
                 None,
                 rumps.MenuItem("今すぐ1回キャプチャ", callback=self.on_capture_now),
@@ -333,6 +344,7 @@ def run_menubar() -> None:
                 self.title = "everlog ○"
                 self.status_item.title = "定期キャプチャ: ○停止中"
             self._sync_interval_menu()
+            self._sync_capture_mode_menu()
             self._sync_autostart_menu()
 
         def on_start(self, _):
@@ -366,6 +378,25 @@ def run_menubar() -> None:
                 if current in self.interval_items
                 else f"間隔: キャプチャ間隔を指定（現在 {self._format_interval(current)}）"
             )
+
+        def _set_capture_mode(self, mode: str):
+            cfg = load_config()
+            if mode not in {"active_only", "all_displays"}:
+                return
+            cfg.capture_mode = mode
+            save_config(cfg)
+            self._sync_capture_mode_menu()
+            if mode == "active_only":
+                msg = "アクティブ画面のみ取得に変更しました"
+            else:
+                msg = "全画面取得（旧仕様）に変更しました"
+            rumps.notification("everlog", "取得範囲変更", msg)
+
+        def _sync_capture_mode_menu(self):
+            cfg = load_config()
+            mode = (cfg.capture_mode or "active_only").strip().lower()
+            self.capture_mode_active_item.state = 1 if mode == "active_only" else 0
+            self.capture_mode_all_item.state = 1 if mode == "all_displays" else 0
 
         def _format_interval(self, sec: int) -> str:
             if sec < 60:

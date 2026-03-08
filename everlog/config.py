@@ -75,6 +75,10 @@ class AppConfig:
     interval_sec: int = 300
     browser: str = "chrome"
     keep_screenshots: bool = False
+    # Capture mode:
+    # - "active_only": capture only the currently active display
+    # - "all_displays": capture every display (legacy behavior)
+    capture_mode: str = "active_only"
     # Optional: path to a built macOS app (py2app) to run capture via `open`.
     # This is a workaround when Screen Recording permission cannot be granted to the raw Python binary.
     capture_app_path: str | None = None
@@ -87,6 +91,7 @@ def _to_dict(cfg: AppConfig) -> dict:
         "interval_sec": cfg.interval_sec,
         "browser": cfg.browser,
         "keep_screenshots": cfg.keep_screenshots,
+        "capture_mode": cfg.capture_mode,
         "capture_app_path": cfg.capture_app_path,
         "exclude": {
             "apps": cfg.exclude.apps,
@@ -105,10 +110,14 @@ def _to_dict(cfg: AppConfig) -> dict:
 def _from_dict(data: dict) -> AppConfig:
     exclude = data.get("exclude", {}) or {}
     redact = data.get("redact", {}) or {}
+    capture_mode = str(data.get("capture_mode", "active_only")).strip().lower()
+    if capture_mode not in {"active_only", "all_displays"}:
+        capture_mode = "active_only"
     return AppConfig(
         interval_sec=int(data.get("interval_sec", 300)),
         browser=str(data.get("browser", "chrome")),
         keep_screenshots=bool(data.get("keep_screenshots", False)),
+        capture_mode=capture_mode,
         capture_app_path=(str(data["capture_app_path"]) if data.get("capture_app_path") else None),
         exclude=ExcludeConfig(
             apps=list(exclude.get("apps", ["1Password"])),

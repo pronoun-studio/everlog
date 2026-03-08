@@ -93,14 +93,39 @@ def _screencapture_hint(stderr: str, *, python_resolved: str) -> str | None:
     return None
 
 
-def _screencapture_to(path: Path) -> None:
+def _screencapture_to(path: Path, *, capture_mode: str, active_display: int | None) -> None:
     # -x: no sound / no UI
     # If Screen Recording permission is missing (common under launchd), screencapture exits non-zero.
     # Capture stderr to preserve the reason in JSONL for easier debugging.
     #
-    # NOTE: In some environments, screencapture with a single output path only
-    # captures the main display. To make multi-display capture reliable, iterate
-    # displays with -D and write one file per display (event_id.png, event_id-d2.png, ...).
+    # In active_only mode, capture only one specific display index.
+    # In all_displays mode, iterate -D and write one file per display
+    # (event_id.png, event_id-d2.png, ...).
+    if capture_mode == "active_only":
+        if active_display is None:
+            raise ScreenCaptureError(
+                cmd=["/usr/sbin/screencapture", "-x", "-t", "png", "-D", "?", str(path)],
+                returncode=1,
+                stdout="",
+                stderr="active display is unknown; skipped in active_only mode",
+            )
+        cmd = ["/usr/sbin/screencapture", "-x", "-t", "png", "-D", str(active_display), str(path)]
+        p = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+        )
+        if p.returncode != 0:
+            raise ScreenCaptureError(
+                cmd=cmd,
+                returncode=p.returncode,
+                stdout=(p.stdout or "").strip(),
+                stderr=(p.stderr or "").strip(),
+            )
+        return
+
     captured_any = False
     for display_idx in range(1, 7):
         out_path = path if display_idx == 1 else path.with_name(f"{path.stem}-d{display_idx}{path.suffix}")
@@ -302,7 +327,11 @@ def run_capture_once(force: bool = False) -> None:
     img_path = paths.tmp_dir / f"{event_id}.png"
     img_paths: list[Path] = []
     try:
-        _screencapture_to(img_path)
+        _screencapture_to(
+            img_path,
+            capture_mode=cfg.capture_mode,
+            active_display=active_display.display,
+        )
         # If multiple displays are present, screencapture writes 1 file per screen.
         # Collect all matching outputs so OCR covers the entire workspace.
         img_paths = sorted(paths.tmp_dir.glob(f"{event_id}*.png"))
