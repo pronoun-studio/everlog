@@ -1739,6 +1739,11 @@ def summarize_day_to_markdown(
         lines.append("⚠️ 未完成: 1時間LLM要約が無効/失敗のため、タイムラインは不完全です。")
         lines.append("   （`EVERLOG_HOURLY_LLM=1` と `OPENAI_API_KEY` を設定してください）")
         lines.append("")
+
+    # サマリー情報をトグル（<details>）で折りたたみ
+    lines.append("<details>")
+    lines.append("<summary>📊 LLMサマリー</summary>")
+    lines.append("")
     if start and end:
         try:
             wall = int((end - start).total_seconds())
@@ -1836,6 +1841,8 @@ def summarize_day_to_markdown(
         f"  - 合計: input {_fmt_int(total_in)} / output {_fmt_int(total_out)} tokens（cost: {_fmt_cost(total_cost if any_cost else None)}）"
     )
     lines.append("")
+    lines.append("</details>")
+    lines.append("")
 
     lines.append("## 本日のメイン作業（総括）")
     lines.append("")
@@ -1926,24 +1933,6 @@ def summarize_day_to_markdown(
         else:
             lines.append("（segment-llmが有効ですが、enrich出力が見つかりませんでした）")
         lines.append("")
-    lines.append("## アプリ使用状況（推定）")
-    lines.append("")
-    lines.append("| アプリ | 推定時間 | 使用回数 | 使用傾向 | 主な用途（近似） |")
-    lines.append("|---|---:|---:|---|---|")
-
-    max_app_sec = max(by_app_sec.values()) if by_app_sec else 0
-    for app, sec in by_app_sec.most_common():
-        caps = int(by_app_caps[app])
-        tier = _usage_tier(int(sec), int(max_app_sec))
-        uses: list[str] = []
-        for lbl, _lbl_sec in by_app_labels[app].most_common(2):
-            s = str(lbl)
-            if s.startswith(app + " / "):
-                s = s[len(app) + 3 :]
-            uses.append(s)
-        lines.append(f"| {app} | {_fmt_hm(int(sec))} | {caps} | {tier} | {' / '.join(uses)} |")
-
-    lines.append("")
     lines.append("## タイムライン（推定・1時間）")
     if not hour_packs:
         lines.append("")
