@@ -6,7 +6,7 @@ Collaboration: 実装は `everlog/` と `ocr/ecocr/` にあり、運用ルール
 -->
 # everlog
 
-macOSで、定期スクリーンショット→ローカルOCR→JSONL保存→（任意）LLM要約→日次Markdown生成を行う個人用ツール。
+macOSで、定期スクリーンショット→ローカルOCR→JSONL保存→日次スナップショット生成→週次レポート生成を行う個人用ツール。
 
 ## 重要（権限）
 - 画面収録（Screen Recording）権限が必要です（スクショ/OCRのため）。
@@ -47,31 +47,30 @@ cp -f .build/release/ecdisplay EVERYTIME-LOG/bin/ecdisplay
 ./.venv/bin/everlog capture
 ```
 
-### 2) 今日のMarkdown生成
+### 2) 先週の週次レポート生成
 ```sh
-./.venv/bin/everlog summarize --date today
+./.venv/bin/everlog weekly-run
 ```
 
-### 2.5) LLMで要約を付与（任意）
-OpenAI APIを使ってセグメントに作業名/要約を付けます（`out/YYYY-MM-DD.llm.json` を生成）。
+### 2.1) 週開始日を指定して週次レポート再生成
 ```sh
-# どれか1つでOK:
-# - 環境変数で渡す（シェル実行向け）
-export OPENAI_API_KEY="(your key)"
-export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
+./.venv/bin/everlog weekly-run --week-start 2026-03-23 --force
+```
 
-# - もしくは .env に書く（launchd / .app 実行でも拾いやすい。推奨）
-#   例: プロジェクト直下の `EVERYTIME-LOG/.env` またはプロジェクト直下の `.env`
-#   （別の場所に固定したい場合は `EVERLOG_LOG_HOME` を設定）
+### 2.5) LLMについて
+週次運用では `hourly-llm` / `weekly-llm` / 補助LLM はすべて `gpt-5-nano` 固定です。
+必要なのは `OPENAI_API_KEY` のみです。
+```sh
+export OPENAI_API_KEY="(your key)"
+
+# .env に書く場合の例
 #   OPENAI_API_KEY=...
-#   EVERLOG_LLM_MODEL=gpt-5-nano
-./.venv/bin/everlog enrich --date today
-./.venv/bin/everlog summarize --date today
+./.venv/bin/everlog daily-run
+./.venv/bin/everlog weekly-run
 ```
 ※ OCRテキスト等がOpenAI APIに送信されます。必要に応じて除外/マスク設定を確認してください。
 
 オプション:
-- `--model`: LLMモデル名（デフォルト: 環境変数 `EVERLOG_LLM_MODEL`（互換: `EVERYTIMECAPTURE_LLM_MODEL`）または `gpt-5-nano`）
 - `--max-segments`: 送信するセグメント数の上限（デフォルト: 80）
 
 ### 3) launchd（短命プロセス定期起動）
@@ -105,13 +104,13 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 ./.venv/bin/everlog launchd capture uninstall
 ```
 
-### 3.5) launchd（日次処理: summarize オーケストレーション）
-毎日23:55に当日分の `summarize` を自動実行します（`OPENAI_API_KEY` が必要）。
-また、起動時（RunAtLoad）に未完了日の再試行を行います。
+### 3.5) launchd（日次スナップショット補完）
+毎日23:55に当日分のスナップショットを補完し、起動時（RunAtLoad）には pending 日付と昨日分を再試行します。
+その後、週次 pending があれば再処理します。
 
 - 起動時: 未完了の pending 日付 + 昨日分（未生成/未完了なら）を再試行
-- 23:55: pending 日付を先に再試行し、その後に当日分を実行
-- LLM未完了（`⚠️ 未完成...` や `hour/daily/hour-enrich` のいずれか未実行）の場合は失敗扱いで pending に残り、次回起動時または次回23:55で再実行
+- 23:55: pending 日付を先に再試行し、その後に当日分のスナップショットを実行
+- スナップショット未完了時は `daily_pending.json` に残り、次回起動時または次回23:55で再実行
 - 日次自動実行では `EVERLOG_LLM_TIMEOUT_SEC=300` を設定し、ネットワーク遅延時のタイムアウトを緩和
 ```sh
 ./.venv/bin/everlog launchd daily install
@@ -124,6 +123,21 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 ./.venv/bin/everlog launchd daily restart
 ./.venv/bin/everlog launchd daily status
 ./.venv/bin/everlog launchd daily uninstall
+```
+
+### 3.6) launchd（週次レポート本実行）
+毎週月曜 00:05 に先週分の週次レポートを生成します。`RunAtLoad` も有効なので、再起動直後の pending 消化にも使われます。
+```sh
+./.venv/bin/everlog launchd weekly install
+```
+
+停止/再開/再起動/状態確認/アンインストール:
+```sh
+./.venv/bin/everlog launchd weekly stop
+./.venv/bin/everlog launchd weekly start
+./.venv/bin/everlog launchd weekly restart
+./.venv/bin/everlog launchd weekly status
+./.venv/bin/everlog launchd weekly uninstall
 ```
 
 ### 4) メニューバーUI（rumps）
@@ -171,16 +185,17 @@ export EVERLOG_LLM_MODEL="gpt-5-nano"   # or gpt-5-mini
 - 間隔変更: 1分/5分/10分/30分（デフォルトは5分）。選択中はチェックマーク表示。変更時に通知が出る
 - 除外設定: 「除外設定を開く」→ 1画面のダイアログで除外項目（アプリ/ドメイン/テキスト）を編集・保存
 - 今すぐ1回キャプチャ: 「今すぐ1回キャプチャ」
-- 今日のマークダウン生成: 「今日のマークダウン生成」
+- 先週の週次レポート生成: 「先週の週次レポート生成」
+- 週開始日を指定して週次レポート生成: 月曜日の日付を指定して再生成
 
 ## 主要な実行方法（2つ）
-マークダウン生成には主に以下の2つの方法があります:
+週次レポート生成には主に以下の2つの方法があります:
 
-1. **メニューバーから手動実行**: `everlog.app` のメニューバーから「今日のマークダウン生成」を選択
-2. **毎日23:55に自動実行**: `launchd daily install` で設定。毎日23:55に自動でマークダウン生成
+1. **メニューバーから手動実行**: `everlog.app` のメニューバーから「先週の週次レポート生成」を選択
+2. **毎週月曜 00:05 に自動実行**: `launchd weekly install` で設定。未完了週は `daily-run` と menubar のヘルスチェックでも再試行
 
-いずれの場合も、出力は `EVERYTIME-LOG/out/<date>/<run_id>/` ディレクトリに格納されます。
-（`out/<date>.md` への直接出力は廃止されました）
+主な出力は `EVERYTIME-LOG/weekly/weeks/<week_start>/weekly.report.md` です。
+日次スナップショットは `EVERYTIME-LOG/weekly/days/YYYY-MM-DD.hourly.json` に保存されます。
 
 ### Pythonコード変更時の再ビルド
 `everlog.app`（メニューバー）はpy2appでビルドされており、**Pythonコードがアプリ内にバンドル**されています。
@@ -196,12 +211,14 @@ pkill -f "everlog.app/Contents/MacOS/everlog"
 open dist/everlog.app
 ```
 
-**注**: `launchd daily`（23:55自動実行）は `.venv/bin/python` を直接呼び出すため、
+**注**: `launchd daily` / `launchd weekly` は `.venv/bin/python` を直接呼び出すため、
 `pip install -e .` を実行すればPythonコード変更が反映されます（再ビルド不要）。
 ただし、launchdのplist設定を変更した場合は再インストールが必要です:
 ```sh
 ./.venv/bin/everlog launchd daily uninstall
 ./.venv/bin/everlog launchd daily install
+./.venv/bin/everlog launchd weekly uninstall
+./.venv/bin/everlog launchd weekly install
 ```
 
 ### メニューバーUI仕様（表示）
@@ -209,9 +226,9 @@ open dist/everlog.app
 - 今日のキャプチャ回数: x回
 - 前回キャプチャ時間: yy/MM/dd H:mm
 
-### 進捗表示（マークダウン生成時）
-「今日のマークダウン生成」を実行すると、ネイティブの進捗パネルが表示されます:
-- 現在の処理ステージ名（データ読み込み → LLM要約 → Markdown生成 など）
+### 進捗表示（週次レポート生成時）
+「先週の週次レポート生成」を実行すると、ネイティブの進捗パネルが表示されます:
+- 現在の処理ステージ名（日次スナップショット確認 → クラスタリング → 週次レポート生成 など）
 - 進捗パーセンテージ（プログレスバー）
 - 処理完了後に自動で閉じる
 
@@ -273,7 +290,7 @@ export EVERLOG_CAPTURE_APP="/Users/arima/DEV/everytimecapture/macos_app/dist/eve
 ```
 
 ## Notion同期（任意）
-生成されたマークダウンを Notion データベースに自動同期できます。
+生成された週次レポートを Notion データベースに自動同期できます。
 
 ### 準備
 1. Notion Integration を作成（https://www.notion.so/my-integrations）
@@ -287,14 +304,14 @@ EVERLOG_NOTION_SYNC=1
 ```
 
 ### 同期タイミング
-- `summarize` 実行時に自動同期（`EVERLOG_NOTION_SYNC=1` の場合）
-- 同期失敗時は `~/.everlog/notion_pending.json` に記録され、次回 `summarize` 時に再試行
+- `weekly-run` 実行時に自動同期（`EVERLOG_NOTION_SYNC=1` の場合）
+- 同期失敗時は `EVERYTIME-LOG/weekly/weekly_pending.json` に `stage=notion_sync` で記録され、次回 `weekly-run --retry-pending-only` で再試行
 
 ### Notionデータベース構造
 | プロパティ名 | 型 | Everlogからの値 |
 |---|---|---|
-| `活動ログ` | Title | 日報タイトル |
-| `実施日_編集可` | Date | 対象日付 |
+| `活動ログ` | Title | `週次レポート YYYY-MM-DD - YYYY-MM-DD` |
+| `実施日_編集可` | Date | `week_start` |
 | `ジャンル` | Multi-select | `AutoLog`（固定） |
 
 詳細: `docs/NOTION_SYNC.md`
@@ -302,9 +319,13 @@ EVERLOG_NOTION_SYNC=1
 ## 保存先
 - ログ: `EVERYTIME-LOG/logs/YYYY-MM-DD.jsonl`
 - 出力: `EVERYTIME-LOG/out/YYYY-MM-DD/<run_id>/`
-  - マークダウン: `YY-MM-DD_<daily_title>.md`
   - LLM結果: `YYYY-MM-DD.hourly.llm.json`, `YYYY-MM-DD.daily.llm.json`, `YYYY-MM-DD.hour-enrich.llm.json`
   - （任意）segment-llm結果: `YYYY-MM-DD.llm.json`
+- 週次: `EVERYTIME-LOG/weekly/`
+  - 日次スナップショット: `days/YYYY-MM-DD.hourly.json`
+  - 週次レポート: `weeks/<week_start>/weekly.report.md`
+  - 週次メタ: `weeks/<week_start>/weekly.meta.json`, `weekly.clusters.json`, `weekly.summary.llm.json`
+  - pending: `weekly_pending.json`
 - トレース: `EVERYTIME-LOG/trace/YYYY-MM-DD/<run_id>/`
   - `run.json`, `stage-00.raw.jsonl`, `stage-01.entities.jsonl`, `stage-02.segment.jsonl` など
 - 一時: `EVERYTIME-LOG/tmp/`
@@ -321,8 +342,8 @@ EVERLOG_NOTION_SYNC=1
 - `EVERLOG_CAPTURE_APP`: 画面収録権限を付与した `.app` のパス（互換: `EVERYTIMECAPTURE_CAPTURE_APP`）
 
 ### LLM要約
-- `OPENAI_API_KEY`: LLM要約（`enrich`）に必要
-- `EVERLOG_LLM_MODEL`: LLMモデル名（default `gpt-5-nano`、互換: `EVERYTIMECAPTURE_LLM_MODEL`）
+- `OPENAI_API_KEY`: 日次スナップショット / 週次レポート生成に必要
+- LLMモデルは `gpt-5-nano` 固定
 
 ### Notion同期
 - `NOTION_API_KEY`: Notion Integration Token
@@ -360,17 +381,9 @@ EVERLOG_NOTION_SYNC=1
 ```
 
 ## パイプライン概要
-`summarize` コマンドは以下のステージを経てMarkdownを生成します:
-1. **stage-00.raw**: 生データ保存
-2. **stage-01.entities**: 特徴抽出（アプリ/ドメイン/URL/パス）
-3. **stage-02.segment**: セグメント化（連続した同一作業をグループ化）
-4. **stage-03.segment**: セグメント内OCR統合（重複削除）
-5. **stage-04.hour-pack**: 1時間単位でパッケージ化
-6. **stage-05.hour-llm**: LLMで1時間ごとの要約生成
-7. **stage-06.daily-llm**: LLMで1日全体の総括生成
-8. **stage-07.hour-enrich-llm**: 各時間帯の目的・意味を再解釈
-
-詳細: `docs/PIPLINE_3.md`
+日次スナップショット生成は `hourly-llm` を正本として保存し、`weekly-run` はそれを集約して週次レポートを生成します。
+legacy の `summarize` コマンドは引き続き残っていますが、自動運用の主対象ではありません。
+詳細: `docs/WEEKLY_REPORT_DESIGN.md`
 
 ## 詳細ドキュメント
 - `docs/DESIGN.md`: 設計仕様（要件・データ形式・実行形態・プライバシー方針）
@@ -415,7 +428,6 @@ cd ../..
 # プロジェクト直下に .env を作成
 cat > .env << 'EOF'
 OPENAI_API_KEY=sk-あなたのOpenAIキー
-EVERLOG_LLM_MODEL=gpt-5-nano
 
 # Notion同期を使う場合（任意）
 # NOTION_API_KEY=ntn_あなたのNotionキー
@@ -447,13 +459,14 @@ open macos_app/dist/everlog.app
 ./.venv/bin/everlog launchd menubar install
 ```
 
-メニューバーから「●定期キャプチャの開始」「今日のマークダウン生成」などが利用できます。
+メニューバーから「●定期キャプチャの開始」「先週の週次レポート生成」などが利用できます。
 
 ### 自動生成されるディレクトリ
 以下は初回実行時に自動で作成されます（手動作成不要）：
 - `EVERYTIME-LOG/` - ログ保存ディレクトリ
   - `logs/` - キャプチャログ（JSONL）
-  - `out/` - 出力（マークダウン等）
+  - `out/` - 出力（LLMキャッシュ等）
+  - `weekly/` - 日次スナップショットと週次レポート
   - `trace/` - デバッグ用トレース
   - `tmp/` - 一時ファイル
   - `bin/` - OCRバイナリ配置場所（手順2で配置済み）

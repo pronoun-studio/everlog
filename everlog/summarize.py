@@ -22,7 +22,15 @@ from .jsonl import read_jsonl
 from .config import load_config
 from .paths import ensure_dirs, get_paths
 from .segments import build_segments, build_segments_with_event_trace
-from .llm import LlmError, analyze_day_summary, analyze_hour_blocks, calc_cost_usd
+from .llm import (
+    DEFAULT_LLM_MODEL,
+    LlmError,
+    _load_dotenv_if_needed,
+    analyze_day_summary,
+    analyze_hour_blocks,
+    calc_cost_usd,
+    enrich_hours_with_context,
+)
 from .safety import sanitize_markdown_for_sharing, sanitize_text_for_sharing
 from .timeutil import make_run_id, normalize_date_arg
 
@@ -369,11 +377,10 @@ def _load_llm_map(date: str, *, run_id: str | None = None) -> dict[int, dict[str
 
 def _load_hourly_llm_map(date: str, *, run_id: str | None = None) -> dict[str, dict[str, Any]]:
     path = _hourly_llm_path(date, run_id=run_id)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    data = _read_json_artifact(path)
+    if not data and run_id:
+        data = _read_json_artifact(_latest_output_artifact_path(date, f"{date}.hourly.llm.json"))
+    if not data:
         return {}
     items = data.get("hours") or []
     out: dict[str, dict[str, Any]] = {}
@@ -386,11 +393,10 @@ def _load_hourly_llm_map(date: str, *, run_id: str | None = None) -> dict[str, d
 
 def _load_hourly_llm_meta(date: str, *, run_id: str | None = None) -> dict[str, Any]:
     path = _hourly_llm_path(date, run_id=run_id)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
+    data = _read_json_artifact(path)
+    if not data and run_id:
+        data = _read_json_artifact(_latest_output_artifact_path(date, f"{date}.hourly.llm.json"))
+    if not data:
         return {}
     out: dict[str, Any] = {}
     usage = data.get("usage")
@@ -406,12 +412,9 @@ def _load_hourly_llm_meta(date: str, *, run_id: str | None = None) -> dict[str, 
 
 def _load_daily_llm(date: str, *, run_id: str | None = None) -> dict[str, Any]:
     path = _daily_llm_path(date, run_id=run_id)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except Exception:
-        return {}
+    data = _read_json_artifact(path)
+    if not data and run_id:
+        data = _read_json_artifact(_latest_output_artifact_path(date, f"{date}.daily.llm.json"))
     return data if isinstance(data, dict) else {}
 
 
@@ -509,6 +512,30 @@ def _current_run_id_for_outputs() -> str:
     ).strip()
 
 
+def _latest_output_artifact_path(date: str, filename: str) -> Path | None:
+    out_dir = get_paths().out_dir / date
+    if not out_dir.exists():
+        return None
+    candidates: list[Path] = []
+    for path in out_dir.glob(f"*/{filename}"):
+        if path.is_file():
+            candidates.append(path)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda path: path.stat().st_mtime, reverse=True)
+    return candidates[0]
+
+
+def _read_json_artifact(path: Path | None) -> dict[str, Any]:
+    if not path or not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
 def _hourly_llm_path(date: str, *, run_id: str | None = None) -> Path:
     """
     Hour-level LLM output path.
@@ -564,13 +591,10 @@ def _hour_enrich_llm_enabled() -> bool:
 def _load_hour_enrich_llm(date: str, *, run_id: str | None = None) -> dict[str, Any]:
     """Load hour-enrich LLM cache if available."""
     path = _hour_enrich_llm_path(date, run_id=run_id)
-    if not path.exists():
-        return {}
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        return data if isinstance(data, dict) else {}
-    except Exception:
-        return {}
+    data = _read_json_artifact(path)
+    if not data and run_id:
+        data = _read_json_artifact(_latest_output_artifact_path(date, f"{date}.hour-enrich.llm.json"))
+    return data if isinstance(data, dict) else {}
 
 
 def _load_hour_enrich_llm_map(date: str, *, run_id: str | None = None) -> dict[str, dict[str, Any]]:
@@ -675,6 +699,114 @@ def _llm_timeout_sec() -> int:
     return max(30, timeout)
 
 
+def _openai_api_key() -> str:
+    try:
+        _load_dotenv_if_needed()
+    except Exception:
+        pass
+    return str(os.environ.get("OPENAI_API_KEY") or "").strip()
+
+
+def _json_chars(value: Any) -> int:
+    try:
+        return len(json.dumps(value, ensure_ascii=False))
+    except Exception:
+        return 0
+
+
+def _chunk_rows_by_limits(
+    rows: list[dict[str, Any]],
+    *,
+    max_items: int,
+    max_json_chars: int,
+) -> list[list[dict[str, Any]]]:
+    if not rows:
+        return []
+    out: list[list[dict[str, Any]]] = []
+    cur: list[dict[str, Any]] = []
+    cur_chars = 2
+    max_items = max(1, max_items)
+    max_json_chars = max(512, max_json_chars)
+    for row in rows:
+        row_chars = max(2, _json_chars(row))
+        would_exceed_items = len(cur) >= max_items
+        would_exceed_chars = bool(cur) and (cur_chars + row_chars + 1) > max_json_chars
+        if cur and (would_exceed_items or would_exceed_chars):
+            out.append(cur)
+            cur = []
+            cur_chars = 2
+        cur.append(row)
+        cur_chars += row_chars + 1
+    if cur:
+        out.append(cur)
+    return out
+
+
+def _hourly_llm_batch_char_limit() -> int:
+    raw = (
+        os.environ.get("EVERLOG_HOURLY_LLM_BATCH_JSON_CHARS")
+        or os.environ.get("EVERYTIMECAPTURE_HOURLY_LLM_BATCH_JSON_CHARS")
+        or ""
+    ).strip()
+    try:
+        value = int(raw) if raw else 32000
+    except Exception:
+        value = 32000
+    return max(4000, value)
+
+
+def _daily_llm_chunk_size() -> int:
+    raw = (
+        os.environ.get("EVERLOG_DAILY_LLM_CHUNK_SIZE")
+        or os.environ.get("EVERYTIMECAPTURE_DAILY_LLM_CHUNK_SIZE")
+        or ""
+    ).strip()
+    try:
+        value = int(raw) if raw else 4
+    except Exception:
+        value = 4
+    return max(1, value)
+
+
+def _daily_llm_chunk_char_limit() -> int:
+    raw = (
+        os.environ.get("EVERLOG_DAILY_LLM_CHUNK_JSON_CHARS")
+        or os.environ.get("EVERYTIMECAPTURE_DAILY_LLM_CHUNK_JSON_CHARS")
+        or ""
+    ).strip()
+    try:
+        value = int(raw) if raw else 6000
+    except Exception:
+        value = 6000
+    return max(1000, value)
+
+
+def _hour_enrich_llm_chunk_size() -> int:
+    raw = (
+        os.environ.get("EVERLOG_HOUR_ENRICH_LLM_CHUNK_SIZE")
+        or os.environ.get("EVERYTIMECAPTURE_HOUR_ENRICH_LLM_CHUNK_SIZE")
+        or ""
+    ).strip()
+    try:
+        value = int(raw) if raw else 4
+    except Exception:
+        value = 4
+    return max(1, value)
+
+
+def _hour_enrich_llm_chunk_char_limit() -> int:
+    raw = (
+        os.environ.get("EVERLOG_HOUR_ENRICH_LLM_CHUNK_JSON_CHARS")
+        or os.environ.get("EVERYTIMECAPTURE_HOUR_ENRICH_LLM_CHUNK_JSON_CHARS")
+        or ""
+    ).strip()
+    try:
+        value = int(raw) if raw else 5000
+    except Exception:
+        value = 5000
+    return max(1000, value)
+
+
 def _llm_api_host_port() -> tuple[str, int]:
     base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").strip()
     if not base:
@@ -742,6 +874,130 @@ def _hourly_llm_batch_size() -> int:
     return max(1, v)
 
 
+def _eligible_hour_packs_for_llm(hour_packs: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    min_sec = _hourly_llm_min_sec()
+    max_hours = _hourly_llm_max_hours()
+    eligible = [h for h in hour_packs if int(h.get("active_sec_est") or 0) >= min_sec]
+    if max_hours > 0 and len(eligible) > max_hours:
+        eligible = sorted(
+            eligible,
+            key=lambda h: (-(int(h.get("active_sec_est") or 0)), str(h.get("hour_start_ts") or "")),
+        )[:max_hours]
+        eligible = sorted(eligible, key=lambda h: str(h.get("hour_start_ts") or ""))
+    return eligible
+
+
+def _write_hourly_llm_artifact(
+    date: str,
+    *,
+    run_id: str,
+    model_name: str,
+    hours: list[dict[str, Any]],
+    usages: list[dict[str, Any]],
+    partial: bool = False,
+    failed_batches: int = 0,
+) -> dict[str, Any]:
+    merged_usage = _merge_llm_usage(usages) if usages else {}
+    cost_usd = calc_cost_usd(merged_usage, model_name)
+    data = {
+        "date": date,
+        "model": model_name,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "hour_count": len(hours),
+        "usage": merged_usage,
+        "cost_usd": cost_usd,
+        "hours": sorted(hours, key=lambda h: str(h.get("hour_start_ts") or "")),
+    }
+    if partial:
+        data["partial"] = True
+        data["failed_batches"] = int(failed_batches)
+    _hourly_llm_path(date, run_id=run_id).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return data
+
+
+def _write_hour_enrich_llm_artifact(
+    date: str,
+    *,
+    run_id: str,
+    model_name: str,
+    hours: list[dict[str, Any]],
+    usages: list[dict[str, Any]],
+    partial: bool = False,
+) -> dict[str, Any]:
+    merged_usage = _merge_llm_usage(usages) if usages else {}
+    cost_usd = calc_cost_usd(merged_usage, model_name)
+    data = {
+        "date": date,
+        "model": model_name,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "hour_count": len(hours),
+        "usage": merged_usage,
+        "cost_usd": cost_usd,
+        "hours": sorted(hours, key=lambda h: str(h.get("hour_start_ts") or "")),
+        "run_id": run_id,
+    }
+    if partial:
+        data["partial"] = True
+    _hour_enrich_llm_path(date, run_id=run_id).write_text(
+        json.dumps(data, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
+    return data
+
+
+def _build_hours_overview(
+    hour_packs: list[dict[str, Any]],
+    hourly_llm_map: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    hours_overview: list[dict[str, Any]] = []
+    for h in hour_packs:
+        hour_key = str(h.get("hour_start_ts") or "").strip()
+        if not hour_key:
+            continue
+        llm_h = hourly_llm_map.get(hour_key) or {}
+        title = str(llm_h.get("hour_title") or "").strip()
+        summary = str(llm_h.get("hour_summary") or "").strip()
+        if not title:
+            labels = _hour_pack_cluster_labels(h)
+            title = labels[0] if labels else ""
+        if not title and not summary:
+            continue
+        hours_overview.append(
+            {
+                "hour_start_ts": hour_key,
+                "hour_end_ts": str(h.get("hour_end_ts") or ""),
+                "hour_title": title,
+                "hour_summary": _shorten_token(summary, max_len=120),
+            }
+        )
+    return hours_overview
+
+
+def _build_daily_rollup_item(
+    source_rows: list[dict[str, Any]],
+    daily_data: dict[str, Any],
+) -> dict[str, Any]:
+    first = source_rows[0]
+    last = source_rows[-1]
+    title = str(daily_data.get("daily_title") or "").strip()
+    if not title:
+        title = str(first.get("hour_title") or "").strip()
+    summary = str(daily_data.get("daily_summary") or "").strip()
+    if not summary:
+        summary = str(daily_data.get("daily_detail") or "").strip()
+    active_min = sum(int(row.get("active_min_est") or 0) for row in source_rows)
+    return {
+        "hour_start_ts": str(first.get("hour_start_ts") or ""),
+        "hour_end_ts": str(last.get("hour_end_ts") or ""),
+        "active_min_est": active_min,
+        "hour_title": title,
+        "hour_summary": _shorten_token(summary, max_len=160),
+    }
+
+
 def _merge_llm_usage(usages: list[dict[str, Any]]) -> dict[str, Any]:
     """Merge multiple LLM usage dicts by summing token counts."""
     total: dict[str, Any] = {}
@@ -767,11 +1023,10 @@ def _call_hourly_llm_batch(
     model_name: str,
     api_key: str,
     timeout_sec: int,
-    batch_idx: int,
-    batch_total: int,
+    batch_label: str,
 ) -> LlmResult | None:
     """Call analyze_hour_blocks for a single batch with retries."""
-    tag = f"hour-llm batch {batch_idx + 1}/{batch_total}"
+    tag = f"hour-llm batch {batch_label}"
     res = None
     for attempt in range(3):
         try:
@@ -808,99 +1063,262 @@ def _call_hourly_llm_batch(
     return None
 
 
-def _maybe_run_hourly_llm(date: str, hour_packs: list[dict[str, Any]]) -> dict[str, Any] | None:
+def _call_daily_llm_inputs(
+    date: str,
+    *,
+    hours_in: list[dict[str, Any]],
+    model_name: str,
+    api_key: str,
+    stage_label: str,
+) -> LlmResult | None:
+    res = None
+    for attempt in range(3):
+        try:
+            res = analyze_day_summary(
+                date,
+                hours_in,
+                model_name,
+                api_key,
+                timeout_sec=_llm_timeout_sec(),
+            )
+            _pipeline_log(stage_label, f"API call succeeded (attempt {attempt + 1})", model=res.model, usage=res.usage)
+            if attempt > 0:
+                _log_llm_retry(stage_label, attempt + 1, "succeeded")
+            return res
+        except LlmError as e:
+            err_msg = str(e)
+            _pipeline_log(stage_label, f"API call FAILED (attempt {attempt + 1})", error=err_msg)
+            if attempt >= 2:
+                _log_llm_retry(stage_label, attempt + 1, "stopped", "max attempts reached")
+                _pipeline_log(stage_label, "FAIL: max retry attempts reached")
+                return None
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry(stage_label, attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                _pipeline_log(stage_label, "FAIL: non-retryable error", error=err_msg)
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry(stage_label, attempt + 1, "stopped", "network unreachable for retry")
+                _pipeline_log(stage_label, "FAIL: network unreachable")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry(stage_label, attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
+            time.sleep(wait_sec)
+    return res
+
+
+def _call_hour_enrich_inputs(
+    date: str,
+    *,
+    daily_context: dict[str, Any],
+    hours_overview: list[dict[str, Any]],
+    model_name: str,
+    api_key: str,
+    stage_label: str,
+) -> LlmResult | None:
+    res = None
+    for attempt in range(3):
+        try:
+            res = enrich_hours_with_context(
+                date,
+                daily_context,
+                hours_overview,
+                model_name,
+                api_key,
+                timeout_sec=_llm_timeout_sec(),
+            )
+            _pipeline_log(stage_label, f"API call succeeded (attempt {attempt + 1})", model=res.model, usage=res.usage)
+            if attempt > 0:
+                _log_llm_retry(stage_label, attempt + 1, "succeeded")
+            return res
+        except LlmError as e:
+            err_msg = str(e)
+            _pipeline_log(stage_label, f"API call FAILED (attempt {attempt + 1})", error=err_msg)
+            if attempt >= 2:
+                _log_llm_retry(stage_label, attempt + 1, "stopped", "max attempts reached")
+                _pipeline_log(stage_label, "FAIL: max retry attempts reached")
+                return None
+            if not _is_retryable_llm_error(e):
+                _log_llm_retry(stage_label, attempt + 1, "stopped", f"non-retryable error ({err_msg})")
+                _pipeline_log(stage_label, "FAIL: non-retryable error", error=err_msg)
+                return None
+            if not _llm_network_reachable():
+                _log_llm_retry(stage_label, attempt + 1, "stopped", "network unreachable for retry")
+                _pipeline_log(stage_label, "FAIL: network unreachable")
+                return None
+            wait_sec = 1.0 + float(attempt)
+            _log_llm_retry(stage_label, attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
+            time.sleep(wait_sec)
+    return res
+
+
+def _maybe_run_hourly_llm(
+    date: str,
+    hour_packs: list[dict[str, Any]],
+    *,
+    force_enabled: bool = False,
+    model_name_override: str | None = None,
+    run_id: str | None = None,
+    existing_hours_map: dict[str, dict[str, Any]] | None = None,
+) -> dict[str, Any] | None:
     _pipeline_log("hour-llm", "enter", hour_packs_count=len(hour_packs))
-    if not _hourly_llm_enabled():
+    if not force_enabled and not _hourly_llm_enabled():
         _pipeline_log("hour-llm", "SKIP: not enabled (EVERLOG_HOURLY_LLM is not set)")
         return None
     min_sec = _hourly_llm_min_sec()
-    max_hours = _hourly_llm_max_hours()
-
-    eligible = [h for h in hour_packs if int(h.get("active_sec_est") or 0) >= min_sec]
+    eligible = _eligible_hour_packs_for_llm(hour_packs)
     _pipeline_log("hour-llm", "eligible filter done", min_sec=min_sec, eligible=len(eligible), total=len(hour_packs))
     if not eligible:
         _pipeline_log("hour-llm", "SKIP: no eligible hours (all active_sec_est < min_sec)")
         return None
 
-    if max_hours > 0 and len(eligible) > max_hours:
-        _pipeline_log("hour-llm", f"trimming eligible from {len(eligible)} to max_hours={max_hours}")
-        eligible = sorted(
-            eligible,
-            key=lambda h: (-(int(h.get("active_sec_est") or 0)), str(h.get("hour_start_ts") or "")),
-        )[:max_hours]
-        eligible = sorted(eligible, key=lambda h: str(h.get("hour_start_ts") or ""))
+    existing_hours_map = dict(existing_hours_map or {})
+    pending_eligible = [
+        h
+        for h in eligible
+        if str(h.get("hour_start_ts") or "").strip() not in existing_hours_map
+    ]
+    if not pending_eligible:
+        _pipeline_log("hour-llm", "SKIP: all eligible hours already cached", cached_keys=len(existing_hours_map))
+        hours = list(existing_hours_map.values())
+        model_name = model_name_override or DEFAULT_LLM_MODEL
+        usages: list[dict[str, Any]] = []
+        if run_id:
+            meta = _load_hourly_llm_meta(date, run_id=run_id)
+            usage = meta.get("usage")
+            if isinstance(usage, dict):
+                usages.append(usage)
+            model_name = str(meta.get("model") or model_name)
+        return {
+            "date": date,
+            "model": model_name,
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "hour_count": len(hours),
+            "usage": _merge_llm_usage(usages) if usages else {},
+            "cost_usd": calc_cost_usd(_merge_llm_usage(usages), model_name) if usages else None,
+            "hours": sorted(hours, key=lambda h: str(h.get("hour_start_ts") or "")),
+        }
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    model_name = (
-        os.environ.get("EVERLOG_HOURLY_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_HOURLY_LLM_MODEL")
-        or os.environ.get("EVERLOG_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL")
-        or "gpt-5-nano"
-    )
+    api_key = _openai_api_key()
+    model_name = model_name_override or DEFAULT_LLM_MODEL
     timeout_sec = _llm_timeout_sec()
     batch_size = _hourly_llm_batch_size()
+    batch_char_limit = _hourly_llm_batch_char_limit()
     _pipeline_log("hour-llm", "config",
                   model=model_name, api_key_set=bool(api_key),
-                  timeout_sec=timeout_sec, batch_size=batch_size)
+                  timeout_sec=timeout_sec, batch_size=batch_size,
+                  batch_char_limit=batch_char_limit,
+                  cached_keys=len(existing_hours_map))
 
-    payload = _build_hourly_llm_input(eligible)
+    payload = _build_hourly_llm_input(pending_eligible)
     if not payload:
         _pipeline_log("hour-llm", "SKIP: _build_hourly_llm_input returned empty payload", eligible_count=len(eligible))
         return None
-    payload_json_len = len(json.dumps(payload, ensure_ascii=False))
+    payload_json_len = _json_chars(payload)
     _pipeline_log("hour-llm", "payload built", payload_hours=len(payload), payload_json_chars=payload_json_len)
 
-    # Split payload into batches
-    batches: list[list[dict[str, Any]]] = []
-    for i in range(0, len(payload), batch_size):
-        batches.append(payload[i : i + batch_size])
+    batches = _chunk_rows_by_limits(
+        payload,
+        max_items=batch_size,
+        max_json_chars=batch_char_limit,
+    )
     _pipeline_log("hour-llm", f"split into {len(batches)} batch(es)",
-                  sizes=[len(b) for b in batches])
+                  sizes=[len(b) for b in batches],
+                  json_chars=[_json_chars(b) for b in batches])
 
-    all_hours: list[dict[str, Any]] = []
+    all_hours_map = dict(existing_hours_map)
     all_usages: list[dict[str, Any]] = []
+    if run_id:
+        meta = _load_hourly_llm_meta(date, run_id=run_id)
+        usage = meta.get("usage")
+        if isinstance(usage, dict):
+            all_usages.append(usage)
+        existing_model = str(meta.get("model") or "").strip()
+        if existing_model:
+            model_name = existing_model
     model_used = model_name
     failed_batches = 0
 
-    for bi, batch in enumerate(batches):
-        batch_json_len = len(json.dumps(batch, ensure_ascii=False))
-        _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} start",
-                      hours=len(batch), json_chars=batch_json_len)
+    worklist: list[tuple[str, list[dict[str, Any]]]] = [
+        (f"{i + 1}/{len(batches)}", batch) for i, batch in enumerate(batches)
+    ]
+
+    while worklist:
+        label, batch = worklist.pop(0)
+        batch_json_len = _json_chars(batch)
+        _pipeline_log("hour-llm", f"batch {label} start", hours=len(batch), json_chars=batch_json_len)
         res = _call_hourly_llm_batch(
-            date, batch, model_name, api_key, timeout_sec,
-            batch_idx=bi, batch_total=len(batches),
+            date,
+            batch,
+            model_name,
+            api_key,
+            timeout_sec,
+            batch_label=label,
         )
         if res is not None:
             batch_hours = res.data.get("hours") or []
-            all_hours.extend(batch_hours)
+            for h in batch_hours:
+                hour_key = str(h.get("hour_start_ts") or "").strip()
+                if hour_key:
+                    all_hours_map[hour_key] = h
             all_usages.append(res.usage)
             model_used = res.model
-            _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} done",
+            _pipeline_log("hour-llm", f"batch {label} done",
                           result_hours=len(batch_hours))
+            if run_id:
+                _write_hourly_llm_artifact(
+                    date,
+                    run_id=run_id,
+                    model_name=model_used,
+                    hours=list(all_hours_map.values()),
+                    usages=all_usages,
+                    partial=bool(worklist),
+                    failed_batches=failed_batches,
+                )
         else:
+            if len(batch) > 1:
+                mid = max(1, len(batch) // 2)
+                left = batch[:mid]
+                right = batch[mid:]
+                _pipeline_log(
+                    "hour-llm",
+                    f"batch {label} splitting after failure",
+                    left_hours=len(left),
+                    right_hours=len(right),
+                )
+                worklist = [(f"{label}a", left), (f"{label}b", right)] + worklist
+                continue
             failed_batches += 1
-            _pipeline_log("hour-llm", f"batch {bi + 1}/{len(batches)} FAILED")
+            _pipeline_log("hour-llm", f"batch {label} FAILED")
 
+    all_hours = sorted(all_hours_map.values(), key=lambda h: str(h.get("hour_start_ts") or ""))
     if not all_hours:
         _pipeline_log("hour-llm", "FAIL: all batches returned no hours",
                       failed_batches=failed_batches, total_batches=len(batches))
         return None
 
-    merged_usage = _merge_llm_usage(all_usages) if all_usages else {}
-    cost_usd = calc_cost_usd(merged_usage, model_used)
-    _pipeline_log("hour-llm", "all batches complete",
-                  total_hours=len(all_hours), failed_batches=failed_batches,
-                  merged_usage=merged_usage, cost_usd=cost_usd)
-    return {
+    data = {
         "date": date,
         "model": model_used,
         "generated_at": datetime.now().astimezone().isoformat(),
         "hour_count": len(all_hours),
-        "usage": merged_usage,
-        "cost_usd": cost_usd,
+        "usage": _merge_llm_usage(all_usages) if all_usages else {},
+        "cost_usd": calc_cost_usd(_merge_llm_usage(all_usages), model_used) if all_usages else None,
         "hours": all_hours,
     }
+    if run_id:
+        data = _write_hourly_llm_artifact(
+            date,
+            run_id=run_id,
+            model_name=model_used,
+            hours=all_hours,
+            usages=all_usages,
+            partial=False,
+            failed_batches=failed_batches,
+        )
+    _pipeline_log("hour-llm", "all batches complete",
+                  total_hours=len(all_hours), failed_batches=failed_batches,
+                  merged_usage=data.get("usage") or {}, cost_usd=data.get("cost_usd"))
+    return data
 
 
 def _maybe_run_daily_llm(
@@ -909,9 +1327,10 @@ def _maybe_run_daily_llm(
     hour_packs: list[dict[str, Any]],
     hourly_llm_map: dict[str, dict[str, Any]],
     run_id: str,
+    force_enabled: bool = False,
 ) -> dict[str, Any] | None:
     _pipeline_log("daily-llm", "enter", hour_packs=len(hour_packs), hourly_llm_map_keys=len(hourly_llm_map))
-    if not _daily_llm_enabled():
+    if not force_enabled and not _daily_llm_enabled():
         _pipeline_log("daily-llm", "SKIP: not enabled")
         return None
     if not hour_packs:
@@ -948,63 +1367,78 @@ def _maybe_run_daily_llm(
         _pipeline_log("daily-llm", "SKIP: hours_in is empty after filtering")
         return None
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    model_name = (
-        os.environ.get("EVERLOG_DAILY_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_DAILY_LLM_MODEL")
-        or os.environ.get("EVERLOG_HOURLY_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_HOURLY_LLM_MODEL")
-        or os.environ.get("EVERLOG_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL")
-        or "gpt-5-nano"
+    api_key = _openai_api_key()
+    model_name = DEFAULT_LLM_MODEL
+    chunk_size = _daily_llm_chunk_size()
+    chunk_char_limit = _daily_llm_chunk_char_limit()
+    chunks = _chunk_rows_by_limits(
+        hours_in,
+        max_items=chunk_size,
+        max_json_chars=chunk_char_limit,
     )
-    _pipeline_log("daily-llm", "calling API", model=model_name, hours_in_count=len(hours_in), api_key_set=bool(api_key))
+    _pipeline_log(
+        "daily-llm",
+        "prepared inputs",
+        model=model_name,
+        hours_in_count=len(hours_in),
+        api_key_set=bool(api_key),
+        chunk_count=len(chunks),
+        chunk_sizes=[len(chunk) for chunk in chunks],
+        chunk_json_chars=[_json_chars(chunk) for chunk in chunks],
+    )
 
-    res = None
-    for attempt in range(3):
-        try:
-            res = analyze_day_summary(
-                date,
-                hours_in,
-                model_name,
-                api_key,
-                timeout_sec=_llm_timeout_sec(),
-            )
-            _pipeline_log("daily-llm", f"API call succeeded (attempt {attempt + 1})", model=res.model, usage=res.usage)
-            if attempt > 0:
-                _log_llm_retry("daily-llm", attempt + 1, "succeeded")
-            break
-        except LlmError as e:
-            err_msg = str(e)
-            _pipeline_log("daily-llm", f"API call FAILED (attempt {attempt + 1})", error=err_msg)
-            if attempt >= 2:
-                _log_llm_retry("daily-llm", attempt + 1, "stopped", "max attempts reached")
-                _pipeline_log("daily-llm", "FAIL: max retry attempts reached")
-                return None
-            if not _is_retryable_llm_error(e):
-                _log_llm_retry("daily-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})")
-                _pipeline_log("daily-llm", "FAIL: non-retryable error", error=err_msg)
-                return None
-            if not _llm_network_reachable():
-                _log_llm_retry("daily-llm", attempt + 1, "stopped", "network unreachable for retry")
-                _pipeline_log("daily-llm", "FAIL: network unreachable")
-                return None
-            wait_sec = 1.0 + float(attempt)
-            _log_llm_retry("daily-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})")
-            time.sleep(wait_sec)
-    if res is None:
-        _pipeline_log("daily-llm", "FAIL: res is None after retry loop (unexpected)")
+    chunk_rollups: list[dict[str, Any]] = []
+    usages: list[dict[str, Any]] = []
+    model_used = model_name
+    single_chunk_daily: dict[str, Any] | None = None
+    for idx, chunk in enumerate(chunks, start=1):
+        stage_label = f"daily-llm chunk {idx}/{len(chunks)}"
+        res = _call_daily_llm_inputs(
+            date,
+            hours_in=chunk,
+            model_name=model_name,
+            api_key=api_key,
+            stage_label=stage_label,
+        )
+        if res is None:
+            return None
+        model_used = res.model
+        usages.append(res.usage)
+        data = res.data if isinstance(res.data, dict) else {}
+        if len(chunks) == 1:
+            single_chunk_daily = data
+        chunk_rollups.append(_build_daily_rollup_item(chunk, data))
+
+    final_inputs = chunk_rollups
+    if len(chunk_rollups) == 1:
+        daily = single_chunk_daily or {}
+    else:
+        final_stage_label = "daily-llm final"
+        final_res = _call_daily_llm_inputs(
+            date,
+            hours_in=final_inputs,
+            model_name=model_used,
+            api_key=api_key,
+            stage_label=final_stage_label,
+        )
+        if final_res is None:
+            return None
+        model_used = final_res.model
+        usages.append(final_res.usage)
+        daily = final_res.data if isinstance(final_res.data, dict) else {}
+
+    if not isinstance(daily, dict):
         return None
-    cost_usd = calc_cost_usd(res.usage, res.model)
-    data = res.data if isinstance(res.data, dict) else {}
+    merged_usage = _merge_llm_usage(usages) if usages else {}
+    cost_usd = calc_cost_usd(merged_usage, model_used)
     return {
         "date": date,
-        "model": res.model,
+        "model": model_used,
         "generated_at": datetime.now().astimezone().isoformat(),
         "hour_count": len(hours_in),
-        "usage": res.usage,
+        "usage": merged_usage,
         "cost_usd": cost_usd,
-        "daily": data,
+        "daily": daily,
         "run_id": run_id,
     }
 
@@ -1016,13 +1450,15 @@ def _maybe_run_hour_enrich_llm(
     hourly_llm_map: dict[str, dict[str, Any]],
     hour_packs: list[dict[str, Any]],
     run_id: str,
+    force_enabled: bool = False,
+    existing_hours_map: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any] | None:
     """
     daily contextを踏まえて各時間帯の目的・意味を再解釈する。
     daily_llm と hourly_llm_map が必要。
     """
     _pipeline_log("hour-enrich", "enter", daily_llm_present=bool(daily_llm), hourly_map_keys=len(hourly_llm_map))
-    if not _hour_enrich_llm_enabled():
+    if not force_enabled and not _hour_enrich_llm_enabled():
         _pipeline_log("hour-enrich", "SKIP: not enabled")
         return None
     if not daily_llm:
@@ -1046,92 +1482,100 @@ def _maybe_run_hour_enrich_llm(
         "daily_summary": daily_summary,
     }
 
-    # hours overview を構築
-    hours_overview: list[dict[str, Any]] = []
-    for h in hour_packs:
-        hour_key = str(h.get("hour_start_ts") or "").strip()
-        if not hour_key:
-            continue
-        llm_h = hourly_llm_map.get(hour_key) or {}
-        title = str(llm_h.get("hour_title") or "").strip()
-        summary = str(llm_h.get("hour_summary") or "").strip()
-        if not title:
-            labels = _hour_pack_cluster_labels(h)
-            title = labels[0] if labels else ""
-        if not title and not summary:
-            continue
-        hours_overview.append(
-            {
-                "hour_start_ts": hour_key,
-                "hour_end_ts": str(h.get("hour_end_ts") or ""),
-                "hour_title": title,
-                "hour_summary": _shorten_token(summary, max_len=200),
-            }
-        )
-
+    existing_hours_map = dict(existing_hours_map or {})
+    hours_overview = _build_hours_overview(hour_packs, hourly_llm_map)
     if not hours_overview:
         return None
 
-    api_key = os.environ.get("OPENAI_API_KEY", "")
-    model_name = (
-        os.environ.get("EVERLOG_HOUR_ENRICH_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_HOUR_ENRICH_LLM_MODEL")
-        or os.environ.get("EVERLOG_DAILY_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_DAILY_LLM_MODEL")
-        or os.environ.get("EVERLOG_LLM_MODEL")
-        or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL")
-        or "gpt-5-nano"
+    pending_overview = [
+        row
+        for row in hours_overview
+        if str(row.get("hour_start_ts") or "").strip() not in existing_hours_map
+    ]
+    if not pending_overview:
+        _pipeline_log("hour-enrich", "SKIP: all hours already cached", cached_keys=len(existing_hours_map))
+        usages: list[dict[str, Any]] = []
+        meta = _load_hour_enrich_llm(date, run_id=run_id)
+        usage = meta.get("usage")
+        if isinstance(usage, dict):
+            usages.append(usage)
+        model_name = str(meta.get("model") or DEFAULT_LLM_MODEL)
+        return {
+            "date": date,
+            "model": model_name,
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "hour_count": len(existing_hours_map),
+            "usage": _merge_llm_usage(usages) if usages else {},
+            "cost_usd": calc_cost_usd(_merge_llm_usage(usages), model_name) if usages else None,
+            "hours": sorted(existing_hours_map.values(), key=lambda h: str(h.get("hour_start_ts") or "")),
+            "run_id": run_id,
+        }
+
+    api_key = _openai_api_key()
+    model_name = DEFAULT_LLM_MODEL
+    chunk_size = _hour_enrich_llm_chunk_size()
+    chunk_char_limit = _hour_enrich_llm_chunk_char_limit()
+    chunks = _chunk_rows_by_limits(
+        pending_overview,
+        max_items=chunk_size,
+        max_json_chars=chunk_char_limit,
+    )
+    _pipeline_log(
+        "hour-enrich",
+        "prepared inputs",
+        hours_count=len(pending_overview),
+        chunk_count=len(chunks),
+        chunk_sizes=[len(chunk) for chunk in chunks],
+        chunk_json_chars=[_json_chars(chunk) for chunk in chunks],
+        api_key_set=bool(api_key),
     )
 
-    from .llm import enrich_hours_with_context
+    all_hours_map = dict(existing_hours_map)
+    usages: list[dict[str, Any]] = []
+    meta = _load_hour_enrich_llm(date, run_id=run_id)
+    usage = meta.get("usage")
+    if isinstance(usage, dict):
+        usages.append(usage)
+    existing_model = str(meta.get("model") or "").strip()
+    if existing_model:
+        model_name = existing_model
 
-    res = None
-    for attempt in range(3):
-        try:
-            res = enrich_hours_with_context(
-                date,
-                daily_context,
-                hours_overview,
-                model_name,
-                api_key,
-                timeout_sec=_llm_timeout_sec(),
-            )
-            if attempt > 0:
-                _log_llm_retry("hour-enrich-llm", attempt + 1, "succeeded")
-            break
-        except LlmError as e:
-            err_msg = str(e)
-            if attempt >= 2:
-                _log_llm_retry("hour-enrich-llm", attempt + 1, "stopped", "max attempts reached")
-                return None
-            if not _is_retryable_llm_error(e):
-                _log_llm_retry(
-                    "hour-enrich-llm", attempt + 1, "stopped", f"non-retryable error ({err_msg})"
-                )
-                return None
-            if not _llm_network_reachable():
-                _log_llm_retry("hour-enrich-llm", attempt + 1, "stopped", "network unreachable for retry")
-                return None
-            wait_sec = 1.0 + float(attempt)
-            _log_llm_retry(
-                "hour-enrich-llm", attempt + 1, "retrying", f"wait {wait_sec:.1f}s ({err_msg})"
-            )
-            time.sleep(wait_sec)
-    if res is None:
-        return None
+    for idx, chunk in enumerate(chunks, start=1):
+        stage_label = f"hour-enrich-llm chunk {idx}/{len(chunks)}"
+        res = _call_hour_enrich_inputs(
+            date,
+            daily_context=daily_context,
+            hours_overview=chunk,
+            model_name=model_name,
+            api_key=api_key,
+            stage_label=stage_label,
+        )
+        if res is None:
+            return None
+        model_name = res.model
+        usages.append(res.usage)
+        data = res.data if isinstance(res.data, dict) else {}
+        for row in data.get("hours") or []:
+            hour_key = str(row.get("hour_start_ts") or "").strip()
+            if hour_key:
+                all_hours_map[hour_key] = row
+        _write_hour_enrich_llm_artifact(
+            date,
+            run_id=run_id,
+            model_name=model_name,
+            hours=list(all_hours_map.values()),
+            usages=usages,
+            partial=idx < len(chunks),
+        )
 
-    cost_usd = calc_cost_usd(res.usage, res.model)
-    data = res.data if isinstance(res.data, dict) else {}
-    return {
-        "date": date,
-        "model": res.model,
-        "generated_at": datetime.now().astimezone().isoformat(),
-        "hour_count": len(hours_overview),
-        "usage": res.usage,
-        "cost_usd": cost_usd,
-        "hours": data.get("hours") or [],
-        "run_id": run_id,
-    }
+    return _write_hour_enrich_llm_artifact(
+        date,
+        run_id=run_id,
+        model_name=model_name,
+        hours=list(all_hours_map.values()),
+        usages=usages,
+        partial=False,
+    )
 
 
 def _build_hour_packs(
@@ -1446,6 +1890,220 @@ def _build_segment_groups(event_trace: list[dict[str, Any]]) -> list[dict[str, A
     return rows
 
 
+def _weekly_days_dir() -> Path:
+    path = get_paths().home / "weekly" / "days"
+    path.mkdir(parents=True, exist_ok=True)
+    return path
+
+
+def _day_snapshot_path(date: str) -> Path:
+    return _weekly_days_dir() / f"{date}.hourly.json"
+
+
+def _load_day_snapshot_file(path: Path) -> dict[str, Any]:
+    if not path.exists():
+        return {}
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return {}
+    return data if isinstance(data, dict) else {}
+
+
+def build_day_snapshot(
+    date_arg: str,
+    *,
+    force: bool = False,
+    progress_callback: ProgressCallback | None = None,
+) -> Path:
+    def _progress(percent: int, stage: str) -> None:
+        if progress_callback:
+            progress_callback(percent, stage)
+
+    date = normalize_date_arg(date_arg)
+    ensure_dirs()
+    _openai_api_key()
+    snapshot_path = _day_snapshot_path(date)
+    if not force:
+        existing = _load_day_snapshot_file(snapshot_path)
+        if str(existing.get("status") or "").strip() == "complete":
+            return snapshot_path
+
+    p = get_paths()
+    log_path = p.logs_dir / f"{date}.jsonl"
+    output_run_id = (
+        os.environ.get("EVERLOG_OUTPUT_RUN_ID")
+        or os.environ.get("EVERYTIMECAPTURE_OUTPUT_RUN_ID")
+        or os.environ.get("EVERLOG_TRACE_RUN_ID")
+        or os.environ.get("EVERYTIMECAPTURE_TRACE_RUN_ID")
+        or ""
+    ).strip() or make_run_id()
+    out_dir = p.out_dir / date / output_run_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _init_pipeline_log(out_dir)
+    _pipeline_log("snapshot", "start", date=date, run_id=output_run_id)
+
+    _progress(0, "snapshot: ログ読込中")
+    events = read_jsonl(log_path)
+    if not events:
+        empty_snapshot = {
+            "date": date,
+            "source_run_id": output_run_id,
+            "generated_at": datetime.now().astimezone().isoformat(),
+            "model": DEFAULT_LLM_MODEL,
+            "status": "complete",
+            "incomplete_reason": "",
+            "total_active_sec_est": 0,
+            "daily_status": "missing",
+            "hour_enrich_status": "missing",
+            "daily": {},
+            "hours": [],
+        }
+        snapshot_path.write_text(json.dumps(empty_snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        _progress(100, "snapshot: 完了（ログなし）")
+        return snapshot_path
+
+    interval_sec = int((events[-1].get("interval_sec") if events else 0) or 0) or 300
+    _progress(20, "snapshot: セグメント化中")
+    _segments, event_trace = build_segments_with_event_trace(events, interval_sec)
+    segment_rows = _build_segment_groups(event_trace)
+    hour_packs = _build_hour_packs(events, segment_rows, interval_sec)
+
+    hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
+    eligible_keys = {
+        str(h.get("hour_start_ts") or "").strip()
+        for h in _eligible_hour_packs_for_llm(hour_packs)
+        if str(h.get("hour_start_ts") or "").strip()
+    }
+    missing_keys = sorted(k for k in eligible_keys if k not in hourly_llm_map)
+    if missing_keys:
+        _progress(55, "snapshot: hourly-llm 実行中")
+        hourly_out = _maybe_run_hourly_llm(
+            date,
+            hour_packs,
+            force_enabled=True,
+            model_name_override=DEFAULT_LLM_MODEL,
+            run_id=output_run_id,
+            existing_hours_map=hourly_llm_map,
+        )
+        hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
+    else:
+        hourly_out = {"hours": list(hourly_llm_map.values())}
+
+    missing_keys = sorted(k for k in eligible_keys if k not in hourly_llm_map)
+    status = "complete"
+    incomplete_reason = ""
+    if missing_keys:
+        status = "incomplete"
+        api_key = _openai_api_key()
+        if not api_key:
+            incomplete_reason = "openai_api_key_missing"
+        elif not hourly_out:
+            incomplete_reason = "hourly_llm_unavailable"
+        else:
+            incomplete_reason = f"hourly_llm_missing:{len(missing_keys)}"
+
+    daily_llm: dict[str, Any] = {}
+    if hour_packs:
+        _progress(70, "snapshot: daily-llm 実行中")
+        daily_llm = _load_daily_llm(date, run_id=output_run_id)
+        if not daily_llm:
+            daily_out = _maybe_run_daily_llm(
+                date,
+                hour_packs=hour_packs,
+                hourly_llm_map=hourly_llm_map,
+                run_id=output_run_id,
+                force_enabled=True,
+            )
+            if daily_out:
+                _daily_llm_path(date, run_id=output_run_id).write_text(
+                    json.dumps(daily_out, ensure_ascii=False, indent=2) + "\n",
+                    encoding="utf-8",
+                )
+                daily_llm = _load_daily_llm(date, run_id=output_run_id)
+
+    hour_enrich_llm_map: dict[str, dict[str, Any]] = {}
+    if hour_packs:
+        _progress(85, "snapshot: hour-enrich-llm 実行中")
+        hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
+        hours_overview = _build_hours_overview(hour_packs, hourly_llm_map)
+        missing_enrich_keys = sorted(
+            str(row.get("hour_start_ts") or "").strip()
+            for row in hours_overview
+            if str(row.get("hour_start_ts") or "").strip() not in hour_enrich_llm_map
+        )
+        if missing_enrich_keys and daily_llm and hourly_llm_map:
+            hour_enrich_out = _maybe_run_hour_enrich_llm(
+                date,
+                daily_llm=daily_llm,
+                hourly_llm_map=hourly_llm_map,
+                hour_packs=hour_packs,
+                run_id=output_run_id,
+                force_enabled=True,
+                existing_hours_map=hour_enrich_llm_map,
+            )
+            if hour_enrich_out:
+                hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
+
+    daily_data = daily_llm.get("daily") if isinstance(daily_llm, dict) else None
+    daily_snapshot = daily_data if isinstance(daily_data, dict) else {}
+    daily_status = (
+        "complete"
+        if any(str(daily_snapshot.get(k) or "").strip() for k in ("daily_title", "daily_summary", "daily_detail"))
+        else "missing"
+    )
+    hour_enrich_status = "complete" if hour_enrich_llm_map else "missing"
+
+    hours: list[dict[str, Any]] = []
+    total_active_sec_est = 0
+    for h in sorted(hour_packs, key=lambda row: str(row.get("hour_start_ts") or "")):
+        hour_key = str(h.get("hour_start_ts") or "").strip()
+        if not hour_key:
+            continue
+        active_sec_est = int(h.get("active_sec_est") or 0)
+        total_active_sec_est += active_sec_est
+        llm_h = hourly_llm_map.get(hour_key) or {}
+        enrich_h = hour_enrich_llm_map.get(hour_key) or {}
+        hour_title = str(llm_h.get("hour_title") or "").strip()
+        hour_summary = str(llm_h.get("hour_summary") or "").strip()
+        cluster_labels = _hour_pack_cluster_labels(h)
+        hour_title_enriched = str(enrich_h.get("hour_title_enriched") or "").strip()
+        hour_summary_enriched = str(enrich_h.get("hour_summary_enriched") or "").strip()
+        if not hour_title and not hour_summary and active_sec_est <= 0:
+            continue
+        hours.append(
+            {
+                "hour_start_ts": hour_key,
+                "hour_end_ts": str(h.get("hour_end_ts") or ""),
+                "active_sec_est": active_sec_est,
+                "hour_title": hour_title,
+                "hour_summary": hour_summary,
+                "hour_title_enriched": hour_title_enriched,
+                "hour_summary_enriched": hour_summary_enriched,
+                "cluster_labels": cluster_labels,
+                "confidence": float(llm_h.get("confidence") or 0.0),
+            }
+        )
+
+    snapshot = {
+        "date": date,
+        "source_run_id": output_run_id,
+        "generated_at": datetime.now().astimezone().isoformat(),
+        "model": DEFAULT_LLM_MODEL,
+        "status": status,
+        "incomplete_reason": incomplete_reason,
+        "total_active_sec_est": total_active_sec_est,
+        "daily_status": daily_status,
+        "hour_enrich_status": hour_enrich_status,
+        "daily": daily_snapshot,
+        "hours": hours,
+    }
+    snapshot_path.write_text(json.dumps(snapshot, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    _pipeline_log("snapshot", "finished", date=date, status=status, output=str(snapshot_path))
+    _progress(100, "snapshot: 完了")
+    return snapshot_path
+
+
 def summarize_day_to_markdown(
     date_arg: str,
     *,
@@ -1526,6 +2184,7 @@ def summarize_day_to_markdown(
     out_dir.mkdir(parents=True, exist_ok=True)
     # NOTE: out/<date>.md への「latest」コピーは廃止。常に out/<date>/<run_id>/ に格納する。
     _init_pipeline_log(out_dir)
+    _openai_api_key()
     _pipeline_log("pipeline", f"start summarize_day_to_markdown date={date} run_id={output_run_id}")
     _pipeline_log("pipeline", "env check",
                   EVERLOG_HOURLY_LLM=os.environ.get("EVERLOG_HOURLY_LLM", "(unset)"),
@@ -1603,28 +2262,39 @@ def summarize_day_to_markdown(
     hourly_llm_required = _hourly_llm_enabled()
     hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
     hourly_llm_meta = _load_hourly_llm_meta(date, run_id=output_run_id)
+    eligible_hourly_keys = {
+        str(h.get("hour_start_ts") or "").strip()
+        for h in _eligible_hour_packs_for_llm(hour_packs)
+        if str(h.get("hour_start_ts") or "").strip()
+    }
+    missing_hourly_keys = sorted(k for k in eligible_hourly_keys if k not in hourly_llm_map)
     _pipeline_log("stage-05", "check",
                   hourly_llm_required=hourly_llm_required,
                   cached_map_keys=len(hourly_llm_map),
                   hour_packs_count=len(hour_packs))
-    if hourly_llm_required and not hourly_llm_map:
+    if hourly_llm_required and missing_hourly_keys:
         _progress(50, "stage-05: hour-llm 実行中")
-        _pipeline_log("stage-05", "no cache, calling _maybe_run_hourly_llm")
-        hourly_out = _maybe_run_hourly_llm(date, hour_packs)
+        _pipeline_log("stage-05", "cache incomplete, calling _maybe_run_hourly_llm",
+                      missing_keys=len(missing_hourly_keys))
+        hourly_out = _maybe_run_hourly_llm(
+            date,
+            hour_packs,
+            run_id=output_run_id,
+            existing_hours_map=hourly_llm_map,
+        )
         if hourly_out:
-            _pipeline_log("stage-05", "hour-llm returned result, saving", hours=len(hourly_out.get("hours") or []))
-            _hourly_llm_path(date, run_id=output_run_id).write_text(
-                json.dumps(hourly_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
+            _pipeline_log("stage-05", "hour-llm returned result", hours=len(hourly_out.get("hours") or []))
             hourly_llm_map = _load_hourly_llm_map(date, run_id=output_run_id)
             hourly_llm_meta = _load_hourly_llm_meta(date, run_id=output_run_id)
         else:
             _pipeline_log("stage-05", "FAIL: _maybe_run_hourly_llm returned None")
     elif hourly_llm_required and hourly_llm_map:
         _pipeline_log("stage-05", "using cached hourly_llm_map", keys=len(hourly_llm_map))
-    hourly_llm_missing = bool(hourly_llm_required and hour_packs and not hourly_llm_map)
+    missing_hourly_keys = sorted(k for k in eligible_hourly_keys if k not in hourly_llm_map)
+    hourly_llm_missing = bool(hourly_llm_required and hour_packs and missing_hourly_keys)
     if hourly_llm_missing:
-        _pipeline_log("stage-05", "WARNING: hourly_llm_missing=True, ⚠️ marker will appear in markdown")
+        _pipeline_log("stage-05", "WARNING: hourly_llm_missing=True, ⚠️ marker will appear in markdown",
+                      missing_keys=len(missing_hourly_keys))
 
     daily_llm = _load_daily_llm(date, run_id=output_run_id)
     _pipeline_log("stage-06", "check",
@@ -1664,21 +2334,26 @@ def summarize_day_to_markdown(
                 hour_enrich_llm_meta = meta
         except Exception:
             hour_enrich_llm_meta = {}
-    if _hour_enrich_llm_enabled() and not hour_enrich_llm_map and daily_llm and hourly_llm_map:
+    hour_enrich_targets = _build_hours_overview(hour_packs, hourly_llm_map)
+    missing_hour_enrich_keys = sorted(
+        str(row.get("hour_start_ts") or "").strip()
+        for row in hour_enrich_targets
+        if str(row.get("hour_start_ts") or "").strip() not in hour_enrich_llm_map
+    )
+    if _hour_enrich_llm_enabled() and missing_hour_enrich_keys and daily_llm and hourly_llm_map:
         _progress(85, "stage-07: hour-enrich-llm 実行中")
-        _pipeline_log("stage-07", "no cache, calling _maybe_run_hour_enrich_llm")
+        _pipeline_log("stage-07", "cache incomplete, calling _maybe_run_hour_enrich_llm",
+                      missing_keys=len(missing_hour_enrich_keys))
         hour_enrich_out = _maybe_run_hour_enrich_llm(
             date,
             daily_llm=daily_llm,
             hourly_llm_map=hourly_llm_map,
             hour_packs=hour_packs,
             run_id=output_run_id,
+            existing_hours_map=hour_enrich_llm_map,
         )
         if hour_enrich_out:
-            _pipeline_log("stage-07", "hour-enrich returned result, saving")
-            _hour_enrich_llm_path(date, run_id=output_run_id).write_text(
-                json.dumps(hour_enrich_out, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
-            )
+            _pipeline_log("stage-07", "hour-enrich returned result")
             hour_enrich_llm_map = _load_hour_enrich_llm_map(date, run_id=output_run_id)
             hour_enrich_llm_meta = _load_hour_enrich_llm(date, run_id=output_run_id)
         else:

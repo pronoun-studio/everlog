@@ -11,6 +11,8 @@ import os
 import re
 import urllib.request
 from pathlib import Path
+from urllib.parse import urlparse
+import socket
 
 
 class LlmError(RuntimeError):
@@ -23,6 +25,9 @@ class LlmResult:
     raw_text: str
     data: dict[str, Any]
     usage: dict[str, Any]
+
+
+DEFAULT_LLM_MODEL = "gpt-5-nano"
 
 _SEGMENTS_SCHEMA: dict[str, Any] = {
     "type": "object",
@@ -123,6 +128,43 @@ _HOUR_ENRICH_SCHEMA: dict[str, Any] = {
                 },
             },
         }
+    },
+}
+
+
+_WEEKLY_CLUSTERS_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["clusters"],
+    "properties": {
+        "clusters": {
+            "type": "array",
+            "items": {
+                "type": "object",
+                "additionalProperties": False,
+                "required": ["cluster_id", "canonical_task_name", "item_ids", "confidence"],
+                "properties": {
+                    "cluster_id": {"type": "string"},
+                    "canonical_task_name": {"type": "string"},
+                    "item_ids": {"type": "array", "items": {"type": "string"}},
+                    "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+                },
+            },
+        }
+    },
+}
+
+
+_WEEKLY_SUMMARY_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "additionalProperties": False,
+    "required": ["weekly_title", "weekly_summary", "weekly_detail", "highlights", "confidence"],
+    "properties": {
+        "weekly_title": {"type": "string"},
+        "weekly_summary": {"type": "string"},
+        "weekly_detail": {"type": "string"},
+        "highlights": {"type": "array", "items": {"type": "string"}},
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
     },
 }
 
@@ -324,12 +366,98 @@ def _build_hour_enrich_prompt(
     )
 
 
-def analyze_segments(
-    date: str,
-    segments: list[dict[str, Any]],
+def _build_weekly_clusters_prompt(
+    week_start: str,
+    week_end: str,
+    task_items: list[dict[str, Any]],
+) -> str:
+    payload = json.dumps(
+        {
+            "week_start": week_start,
+            "week_end": week_end,
+            "task_items": task_items,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return (
+        "あなたは週次作業ログのクラスタリング担当です。以下の task_items を意味ベースでクラスタリングしてください。\n"
+        "\n"
+        "判定基準:\n"
+        "- 同じ成果物・同じ目的・同じ文脈で継続している作業は同一クラスタにまとめる\n"
+        "- ツール名や単語が似ていても、目的や成果物が違えば別クラスタに分ける\n"
+        "- canonical_task_name は週報にそのまま載せられる短い人間向けの名前にする\n"
+        "- 応答はJSON only。説明文は禁止\n"
+        "\n"
+        "制約:\n"
+        "- すべての task_items.id を重複なく必ずどこか1つの cluster に割り当てる\n"
+        "- 空の cluster は作らない\n"
+        "- item_ids には入力の id をそのまま使う\n"
+        "\n"
+        "出力JSONの形式:\n"
+        "{\n"
+        '  "clusters": [\n'
+        "    {\n"
+        '      "cluster_id": "cluster-1",\n'
+        '      "canonical_task_name": "短い作業名",\n'
+        '      "item_ids": ["2026-03-23:0"],\n'
+        '      "confidence": 0.0\n'
+        "    }\n"
+        "  ]\n"
+        "}\n\n"
+        "入力:\n"
+        f"{payload}\n"
+    )
+
+
+def _build_weekly_summary_prompt(
+    week_start: str,
+    week_end: str,
+    day_notes: list[dict[str, Any]],
+) -> str:
+    payload = json.dumps(
+        {
+            "week_start": week_start,
+            "week_end": week_end,
+            "day_notes": day_notes,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    return (
+        "あなたは週次レポートの編集者です。以下の day_notes を主入力として、自然な週次総括を作成してください。\n"
+        "\n"
+        "要件:\n"
+        "- weekly_title: 週の主要テーマを短く具体的に表現する\n"
+        "- weekly_summary: 日本語2〜3文で、週の中心作業と進み方をまとめる\n"
+        "- weekly_detail: 日本語4〜6文。週の流れ、判断、進捗、次のアクションを自然文でまとめる\n"
+        "- highlights: 週の重要ポイントを3件まで短文で出す\n"
+        "- day_notes を主入力として使う\n"
+        "- ツール名やURLの列挙を主役にしない。『何を進めた週か』が読める文章にする\n"
+        "- 自由な創作は禁止。入力にない内容を足しすぎない\n"
+        "- 応答はJSON only\n"
+        "\n"
+        "出力JSONの形式:\n"
+        "{\n"
+        '  "weekly_title": "短い総括タイトル",\n'
+        '  "weekly_summary": "2-3文の要約",\n'
+        '  "weekly_detail": "4-6文の詳細",\n'
+        '  "highlights": ["...", "..."],\n'
+        '  "confidence": 0.0\n'
+        "}\n\n"
+        "入力:\n"
+        f"{payload}\n"
+    )
+
+
+def _openai_responses_request(
+    *,
     model: str,
     api_key: str,
-    timeout_sec: int = 180,
+    user_prompt: str,
+    schema_name: str,
+    schema: dict[str, Any],
+    timeout_sec: int,
 ) -> LlmResult:
     _load_dotenv_if_needed()
     if not api_key:
@@ -348,7 +476,6 @@ def analyze_segments(
         "You are a precise assistant that returns JSON only. "
         "Do not include any extra text outside of JSON."
     )
-    user_prompt = _build_user_prompt(date, segments)
 
     body = {
         "model": model,
@@ -359,9 +486,9 @@ def analyze_segments(
         "text": {
             "format": {
                 "type": "json_schema",
-                "name": "segment_labels",
+                "name": schema_name,
                 "strict": True,
-                "schema": _SEGMENTS_SCHEMA,
+                "schema": schema,
             }
         },
     }
@@ -401,6 +528,24 @@ def analyze_segments(
         raw_text=raw_text,
         data=parsed,
         usage=usage if isinstance(usage, dict) else {},
+    )
+
+
+def analyze_segments(
+    date: str,
+    segments: list[dict[str, Any]],
+    model: str,
+    api_key: str,
+    timeout_sec: int = 180,
+) -> LlmResult:
+    user_prompt = _build_user_prompt(date, segments)
+    return _openai_responses_request(
+        model=model,
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="segment_labels",
+        schema=_SEGMENTS_SCHEMA,
+        timeout_sec=timeout_sec,
     )
 
 
@@ -411,76 +556,14 @@ def analyze_hour_blocks(
     api_key: str,
     timeout_sec: int = 180,
 ) -> LlmResult:
-    _load_dotenv_if_needed()
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        hint = ""
-        try:
-            from .paths import get_paths
-
-            hint = f" (try putting it in {get_paths().home / '.env'})"
-        except Exception:
-            hint = ""
-        raise LlmError(f"OPENAI_API_KEY is not set.{hint}")
-
-    system_prompt = (
-        "You are a precise assistant that returns JSON only. "
-        "Do not include any extra text outside of JSON."
-    )
     user_prompt = _build_hourly_user_prompt(date, hours)
-
-    body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "hourly_summaries",
-                "strict": True,
-                "schema": _HOURS_SCHEMA,
-            }
-        },
-    }
-
-    base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    url = f"{base}/responses"
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
-    except Exception as e:
-        raise LlmError(f"OpenAI API request failed: {e}") from e
-
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        raise LlmError(f"Failed to parse API response: {e}") from e
-
-    usage = data.get("usage") if isinstance(data, dict) else None
-    raw_text = _extract_output_text(data)
-    if not raw_text:
-        raise LlmError("OpenAI API returned empty content.")
-
-    parsed = _extract_json(raw_text)
-    return LlmResult(
+    return _openai_responses_request(
         model=model,
-        raw_text=raw_text,
-        data=parsed,
-        usage=usage if isinstance(usage, dict) else {},
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="hourly_summaries",
+        schema=_HOURS_SCHEMA,
+        timeout_sec=timeout_sec,
     )
 
 
@@ -494,76 +577,14 @@ def analyze_day_summary(
     """
     Build a daily summary from hour-level summaries (already LLM'd or rule-based).
     """
-    _load_dotenv_if_needed()
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        hint = ""
-        try:
-            from .paths import get_paths
-
-            hint = f" (try putting it in {get_paths().home / '.env'})"
-        except Exception:
-            hint = ""
-        raise LlmError(f"OPENAI_API_KEY is not set.{hint}")
-
-    system_prompt = (
-        "You are a precise assistant that returns JSON only. "
-        "Do not include any extra text outside of JSON."
-    )
     user_prompt = _build_daily_user_prompt(date, hours)
-
-    body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "daily_summary",
-                "strict": True,
-                "schema": _DAILY_SCHEMA,
-            }
-        },
-    }
-
-    base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    url = f"{base}/responses"
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
-    except Exception as e:
-        raise LlmError(f"OpenAI API request failed: {e}") from e
-
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        raise LlmError(f"Failed to parse API response: {e}") from e
-
-    usage = data.get("usage") if isinstance(data, dict) else None
-    raw_text = _extract_output_text(data)
-    if not raw_text:
-        raise LlmError("OpenAI API returned empty content.")
-
-    parsed = _extract_json(raw_text)
-    return LlmResult(
+    return _openai_responses_request(
         model=model,
-        raw_text=raw_text,
-        data=parsed,
-        usage=usage if isinstance(usage, dict) else {},
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="daily_summary",
+        schema=_DAILY_SCHEMA,
+        timeout_sec=timeout_sec,
     )
 
 
@@ -589,77 +610,72 @@ def enrich_hours_with_context(
     Returns:
         LlmResult: hours[].hour_title_enriched, hour_summary_enriched を含む結果
     """
-    _load_dotenv_if_needed()
-    if not api_key:
-        api_key = os.environ.get("OPENAI_API_KEY", "")
-    if not api_key:
-        hint = ""
-        try:
-            from .paths import get_paths
-
-            hint = f" (try putting it in {get_paths().home / '.env'})"
-        except Exception:
-            hint = ""
-        raise LlmError(f"OPENAI_API_KEY is not set.{hint}")
-
-    system_prompt = (
-        "You are a precise assistant that returns JSON only. "
-        "Do not include any extra text outside of JSON."
-    )
     user_prompt = _build_hour_enrich_prompt(date, daily_context, hours_overview)
-
-    body = {
-        "model": model,
-        "input": [
-            {"role": "system", "content": [{"type": "input_text", "text": system_prompt}]},
-            {"role": "user", "content": [{"type": "input_text", "text": user_prompt}]},
-        ],
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "hour_enrich",
-                "strict": True,
-                "schema": _HOUR_ENRICH_SCHEMA,
-            }
-        },
-    }
-
-    base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").rstrip("/")
-    url = f"{base}/responses"
-
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=timeout_sec) as resp:
-            raw = resp.read().decode("utf-8")
-    except Exception as e:
-        raise LlmError(f"OpenAI API request failed: {e}") from e
-
-    try:
-        data = json.loads(raw)
-    except Exception as e:
-        raise LlmError(f"Failed to parse API response: {e}") from e
-
-    usage = data.get("usage") if isinstance(data, dict) else None
-    raw_text = _extract_output_text(data)
-    if not raw_text:
-        raise LlmError("OpenAI API returned empty content.")
-
-    parsed = _extract_json(raw_text)
-    return LlmResult(
+    return _openai_responses_request(
         model=model,
-        raw_text=raw_text,
-        data=parsed,
-        usage=usage if isinstance(usage, dict) else {},
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="hour_enrich",
+        schema=_HOUR_ENRICH_SCHEMA,
+        timeout_sec=timeout_sec,
     )
+
+
+def analyze_weekly_task_clusters(
+    week_start: str,
+    week_end: str,
+    task_items: list[dict[str, Any]],
+    model: str,
+    api_key: str,
+    timeout_sec: int = 180,
+) -> LlmResult:
+    user_prompt = _build_weekly_clusters_prompt(week_start, week_end, task_items)
+    return _openai_responses_request(
+        model=model,
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="weekly_task_clusters",
+        schema=_WEEKLY_CLUSTERS_SCHEMA,
+        timeout_sec=timeout_sec,
+    )
+
+
+def analyze_weekly_summary(
+    week_start: str,
+    week_end: str,
+    day_notes: list[dict[str, Any]],
+    model: str,
+    api_key: str,
+    timeout_sec: int = 180,
+) -> LlmResult:
+    user_prompt = _build_weekly_summary_prompt(week_start, week_end, day_notes)
+    return _openai_responses_request(
+        model=model,
+        api_key=api_key,
+        user_prompt=user_prompt,
+        schema_name="weekly_summary",
+        schema=_WEEKLY_SUMMARY_SCHEMA,
+        timeout_sec=timeout_sec,
+    )
+
+
+def openai_endpoint_reachable(timeout_sec: float = 2.0) -> bool:
+    base = os.environ.get("OPENAI_API_BASE", "https://api.openai.com/v1").strip()
+    if not base:
+        base = "https://api.openai.com/v1"
+    parsed = urlparse(base)
+    host = parsed.hostname or "api.openai.com"
+    if parsed.port:
+        port = int(parsed.port)
+    elif parsed.scheme == "http":
+        port = 80
+    else:
+        port = 443
+    try:
+        with socket.create_connection((host, port), timeout=timeout_sec):
+            return True
+    except Exception:
+        return False
 
 
 def _get_usage_tokens(usage: dict[str, Any] | None) -> tuple[int, int] | None:

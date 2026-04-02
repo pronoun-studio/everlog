@@ -9,15 +9,17 @@ import os
 import subprocess
 import sys
 import threading
-from datetime import datetime
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from .config import load_config, save_config
 from .jsonl import read_jsonl
 from .launchd import capture_program_args
-from .llm import _load_dotenv_if_needed
+from .llm import _load_dotenv_if_needed, openai_endpoint_reachable
 from .paths import get_paths
 from .timeutil import make_run_id
+from .weekly import has_pending_weeks, weekly_run_locked
 
 
 class ProgressPanel:
@@ -250,6 +252,26 @@ def _launched_by_launchd_menubar() -> bool:
     return os.environ.get("XPC_SERVICE_NAME") in {"com.everlog.menubar", "com.everytimecapture.menubar"}
 
 
+def _launchd_agent_plist_exists(labels: list[str]) -> bool:
+    base = Path.home() / "Library" / "LaunchAgents"
+    return any((base / f"{label}.plist").exists() for label in labels)
+
+
+def _ensure_schedule_agents() -> None:
+    if not (_autostart_enabled() or _launched_by_launchd_menubar()):
+        return
+    if not _launchd_agent_plist_exists(["com.everlog.daily", "com.everytimecapture.daily"]):
+        _run_cli(["launchd", "daily", "install"])
+    if not _launchd_agent_plist_exists(["com.everlog.weekly", "com.everytimecapture.weekly"]):
+        _run_cli(["launchd", "weekly", "install"])
+
+
+def _last_week_start() -> str:
+    today = datetime.now().astimezone().date()
+    this_monday = today - timedelta(days=today.weekday())
+    return (this_monday - timedelta(days=7)).isoformat()
+
+
 def run_menubar() -> None:
     # Ensure .env is loaded at startup.
     _load_dotenv_if_needed()
@@ -321,15 +343,17 @@ def run_menubar() -> None:
                 rumps.MenuItem("除外設定を開く", callback=self.on_open_exclusions),
                 None,
                 rumps.MenuItem("今すぐ1回キャプチャ", callback=self.on_capture_now),
-                rumps.MenuItem("今日のマークダウン生成", callback=self.on_summarize_today),
-                rumps.MenuItem("日付を指定してマークダウン生成", callback=self.on_summarize_date),
+                rumps.MenuItem("先週の週次レポート生成", callback=self.on_generate_last_weekly),
+                rumps.MenuItem("週開始日を指定して週次レポート生成", callback=self.on_generate_weekly_date),
                 None,
                 rumps.MenuItem("終了", callback=self.on_quit),
             ]
 
             self.timer = rumps.Timer(self.on_tick, 5)
             self.timer.start()
+            self._last_weekly_healthcheck_at = 0.0
             _ensure_capture_running()
+            _ensure_schedule_agents()
             self.on_tick(None)
 
         def on_tick(self, _):
@@ -346,6 +370,27 @@ def run_menubar() -> None:
             self._sync_interval_menu()
             self._sync_capture_mode_menu()
             self._sync_autostart_menu()
+            self._maybe_trigger_weekly_retry()
+
+        def _maybe_trigger_weekly_retry(self):
+            now = time.monotonic()
+            if (now - self._last_weekly_healthcheck_at) < 600:
+                return
+            self._last_weekly_healthcheck_at = now
+            if not has_pending_weeks():
+                return
+            if weekly_run_locked():
+                return
+            if not openai_endpoint_reachable():
+                return
+            _load_dotenv_if_needed()
+            env = os.environ.copy()
+            subprocess.Popen(
+                [sys.executable, "-m", "everlog.cli", "weekly-run", "--retry-pending-only"],
+                env=env,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
 
         def on_start(self, _):
             _run_cli(["launchd", "capture", "install"])
@@ -630,46 +675,33 @@ def run_menubar() -> None:
             finally:
                 self.on_tick(None)
 
-        def _run_summarize(self, target_date: str, date_str: str):
-            """Run summarize for the specified date with progress display.
-
-            Args:
-                target_date: Date string to pass to CLI (e.g. "today", "2026-02-09")
-                date_str: Date in YYYY-MM-DD format for output directory
-            """
-            # 進捗パネルを作成
-            panel = ProgressPanel(f"マークダウン生成中: {date_str}")
+        def _run_weekly(self, week_start: str, force: bool = False):
+            panel = ProgressPanel(f"週次レポート生成中: {week_start}")
             panel.show()
             panel.update(0, "準備中...")
 
             def progress_callback(percent: int, stage: str):
-                """Callback for progress updates from summarize."""
                 panel.update(percent, stage)
 
-            def run_summarize_thread():
-                """Background thread to run summarize."""
+            def run_weekly_thread():
                 out_path = None
                 error_msg = None
                 try:
-                    # Load .env for API keys
                     _load_dotenv_if_needed()
-
-                    # Set up environment
                     run_id = make_run_id()
                     os.environ["EVERLOG_TRACE"] = "1"
                     os.environ["EVERLOG_TRACE_RUN_ID"] = run_id
                     os.environ["EVERLOG_OUTPUT_RUN_ID"] = run_id
-                    os.environ["EVERLOG_HOURLY_LLM"] = "1"
-                    os.environ["EVERLOG_DAILY_LLM"] = "1"
 
                     try:
-                        run_dir = get_paths().trace_dir / date_str / run_id
+                        run_dir = get_paths().trace_dir / week_start / run_id
                         run_dir.mkdir(parents=True, exist_ok=True)
                         (run_dir / "run.json").write_text(
                             json.dumps(
                                 {
                                     "run_id": run_id,
                                     "source": "menubar",
+                                    "week_start": week_start,
                                     "started_at": datetime.now().astimezone().isoformat(),
                                 },
                                 ensure_ascii=False,
@@ -680,28 +712,33 @@ def run_menubar() -> None:
                     except Exception as e:
                         _debug(f"trace_run_dir: failed: {e}")
 
-                    # Import and run summarize directly with progress callback
-                    from .summarize import summarize_day_to_markdown
+                    from .weekly import run_weekly_automation
 
-                    out_path = summarize_day_to_markdown(
-                        target_date,
+                    outputs = run_weekly_automation(
+                        week_start=week_start,
+                        force=force,
                         progress_callback=progress_callback,
                     )
+                    if outputs:
+                        out_path = outputs[0]
+                    else:
+                        candidate = get_paths().home / "weekly" / "weeks" / week_start / "weekly.report.md"
+                        if candidate.exists():
+                            out_path = candidate
 
                 except Exception as e:
-                    _debug(f"summarize_thread: exception={e}")
+                    _debug(f"weekly_thread: exception={e}")
                     error_msg = str(e)
 
-                # 完了処理をメインスレッドで
                 def show_completion():
                     panel.hide()
                     if error_msg:
-                        rumps.notification("everlog", "エラー", f"マークダウン生成失敗: {error_msg[:50]}")
+                        rumps.notification("everlog", "エラー", f"週次レポート生成失敗: {error_msg[:50]}")
                     elif out_path and out_path.exists():
-                        rumps.notification("everlog", "生成完了", "マークダウンを開きます")
+                        rumps.notification("everlog", "生成完了", "週次レポートを開きます")
                         _run(["open", str(out_path)])
                     else:
-                        rumps.notification("everlog", "エラー", "マークダウンが見つかりません")
+                        rumps.notification("everlog", "エラー", "週次レポートが見つかりません")
 
                 try:
                     from PyObjCTools import AppHelper
@@ -709,19 +746,17 @@ def run_menubar() -> None:
                 except Exception:
                     rumps.Timer(show_completion, 0).start()
 
-            # バックグラウンドスレッドで実行
-            thread = threading.Thread(target=run_summarize_thread, daemon=True)
+            thread = threading.Thread(target=run_weekly_thread, daemon=True)
             thread.start()
 
-        def on_summarize_today(self, _):
-            self._run_summarize("today", _today())
+        def on_generate_last_weekly(self, _):
+            self._run_weekly(_last_week_start())
 
-        def on_summarize_date(self, _):
-            # Show date input dialog
+        def on_generate_weekly_date(self, _):
             win = rumps.Window(
-                message="日付を YYYY-MM-DD 形式で入力してください（例: 2026-02-09）",
-                title="日付を指定してマークダウン生成",
-                default_text=_today(),
+                message="週開始日（月曜日）を YYYY-MM-DD 形式で入力してください",
+                title="週開始日を指定して週次レポート生成",
+                default_text=_last_week_start(),
                 ok="生成",
                 cancel="キャンセル",
                 dimensions=(300, 24),
@@ -730,25 +765,18 @@ def run_menubar() -> None:
             if not res.clicked:
                 return
             date_input = res.text.strip()
-            # Validate date format
             try:
                 parsed_date = datetime.strptime(date_input, "%Y-%m-%d").date()
-                date_str = parsed_date.isoformat()
+                if parsed_date.weekday() != 0:
+                    raise ValueError("not monday")
+                week_start = parsed_date.isoformat()
             except ValueError:
                 rumps.alert(
                     "日付形式が不正です",
-                    "YYYY-MM-DD 形式で入力してください（例: 2026-02-09）",
+                    "月曜日を YYYY-MM-DD 形式で入力してください（例: 2026-03-23）",
                 )
                 return
-            # Check if log file exists for the date
-            log_path = get_paths().logs_dir / f"{date_str}.jsonl"
-            if not log_path.exists():
-                rumps.alert(
-                    "ログが見つかりません",
-                    f"{date_str} のログファイルが存在しません。",
-                )
-                return
-            self._run_summarize(date_str, date_str)
+            self._run_weekly(week_start)
 
         def on_quit(self, _):
             _run_cli(["launchd", "capture", "uninstall"])

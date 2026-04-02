@@ -1,19 +1,16 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 import json
+import os
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 from .paths import ensure_dirs, get_paths
-from .summarize import summarize_day_to_markdown
-
-
-_INCOMPLETE_MARKER = "⚠️ 未完成: 1時間LLM要約が無効/失敗のため、タイムラインは不完全です。"
-_HOUR_MISSING_MARKER = "  - hour-llm（タイムライン用）: 未実行"
-_DAILY_MISSING_MARKER = "  - daily-llm（総括用）: 未実行"
-_HOUR_ENRICH_MISSING_MARKER = "  - hour-enrich-llm（目的・意味付け）: 未実行"
+from .summarize import build_day_snapshot
+from .weekly import cleanup_weekly_storage, run_weekly_automation
 
 
 @dataclass
@@ -28,8 +25,86 @@ def _pending_path() -> Path:
     return get_paths().home / "daily_pending.json"
 
 
+def _lock_path() -> Path:
+    return get_paths().home / ".daily-run.lock"
+
+
 def _now_iso() -> str:
     return datetime.now().astimezone().isoformat()
+
+
+def _now() -> datetime:
+    return datetime.now().astimezone()
+
+
+def _lock_pid_running(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    except Exception:
+        return False
+    return True
+
+
+def daily_run_locked() -> bool:
+    path = _lock_path()
+    if not path.exists():
+        return False
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except Exception:
+        return True
+    pid = int(data.get("pid") or 0)
+    started_at = str(data.get("started_at") or "")
+    if started_at:
+        try:
+            started = datetime.fromisoformat(started_at)
+            if (_now() - started) > timedelta(hours=12):
+                path.unlink(missing_ok=True)
+                return False
+        except Exception:
+            pass
+    if pid and _lock_pid_running(pid):
+        return True
+    path.unlink(missing_ok=True)
+    return False
+
+
+@contextmanager
+def _daily_run_lock() -> Iterator[bool]:
+    ensure_dirs()
+    path = _lock_path()
+    payload = {"pid": os.getpid(), "started_at": _now_iso()}
+    acquired = False
+
+    for _ in range(2):
+        try:
+            fd = os.open(path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            if daily_run_locked():
+                yield False
+                return
+            path.unlink(missing_ok=True)
+            continue
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False, indent=2)
+            f.write("\n")
+        acquired = True
+        break
+
+    if not acquired:
+        yield False
+        return
+
+    try:
+        yield True
+    finally:
+        path.unlink(missing_ok=True)
 
 
 def _load_pending() -> dict[str, PendingItem]:
@@ -78,40 +153,19 @@ def _save_pending(items: dict[str, PendingItem]) -> None:
     )
 
 
-def _find_latest_md_for_date(date: str) -> Path | None:
-    out_day = get_paths().out_dir / date
-    if not out_day.exists():
-        return None
-    candidates: list[Path] = []
-    for run_dir in out_day.iterdir():
-        if not run_dir.is_dir():
-            continue
-        for md in run_dir.glob("*.md"):
-            if md.is_file():
-                candidates.append(md)
-    if not candidates:
-        return None
-    return max(candidates, key=lambda p: p.stat().st_mtime)
+def _snapshot_path(date: str) -> Path:
+    return get_paths().home / "weekly" / "days" / f"{date}.hourly.json"
 
 
-def _is_summary_complete_for_date(date: str) -> bool:
-    md = _find_latest_md_for_date(date)
-    if not md:
+def _is_snapshot_complete_for_date(date: str) -> bool:
+    path = _snapshot_path(date)
+    if not path.exists():
         return False
     try:
-        text = md.read_text(encoding="utf-8")
+        data = json.loads(path.read_text(encoding="utf-8"))
     except Exception:
         return False
-    if _INCOMPLETE_MARKER in text:
-        return False
-    # Treat missing LLM stages as incomplete so daily automation retries later.
-    if _HOUR_MISSING_MARKER in text:
-        return False
-    if _DAILY_MISSING_MARKER in text:
-        return False
-    if _HOUR_ENRICH_MISSING_MARKER in text:
-        return False
-    return True
+    return str(data.get("status") or "").strip() == "complete"
 
 
 def _mark_pending(items: dict[str, PendingItem], date: str, reason: str) -> None:
@@ -132,86 +186,76 @@ def _clear_pending(items: dict[str, PendingItem], date: str) -> None:
         print(f"[daily] Cleared pending: {date}")
 
 
-def _llm_incomplete_reason_from_markdown(text: str) -> str:
-    reasons: list[str] = []
-    if _INCOMPLETE_MARKER in text:
-        reasons.append("hour-llm missing")
-    if _HOUR_MISSING_MARKER in text:
-        reasons.append("hour-llm usage missing")
-    if _DAILY_MISSING_MARKER in text:
-        reasons.append("daily-llm usage missing")
-    if _HOUR_ENRICH_MISSING_MARKER in text:
-        reasons.append("hour-enrich-llm usage missing")
-    if not reasons:
-        return ""
-    return ", ".join(reasons)
-
-
 def _should_run_today(now: datetime) -> bool:
-    # Keep "today summary" as a nightly job (23:55+).
+    # Keep "today snapshot" as a nightly job (23:55+).
     return now.hour == 23 and now.minute >= 55
 
 
 def run_daily_automation() -> int:
     """
-    Run daily summarize orchestration.
+    Run daily snapshot orchestration.
 
     Behavior:
       - Always retry pending dates first.
       - On startup/daytime, auto-try yesterday when it is missing/incomplete.
-      - At 23:55+ run today's summarize as the regular daily job.
-      - If LLM did not run (incomplete marker in markdown), keep date in pending.
+      - At 23:55+ run today's snapshot as the regular daily job.
+      - If snapshot is incomplete, keep date in pending.
     """
-    ensure_dirs()
-    now = datetime.now().astimezone()
-    today = now.date().isoformat()
-    yesterday = (now.date() - timedelta(days=1)).isoformat()
+    with _daily_run_lock() as acquired:
+        if not acquired:
+            print("[daily] Skip: another daily-run is already active.")
+            return 0
 
-    pending = _load_pending()
+        ensure_dirs()
+        cleanup_weekly_storage()
+        now = _now()
+        today = now.date().isoformat()
+        yesterday = (now.date() - timedelta(days=1)).isoformat()
 
-    queue: list[str] = []
-    queue.extend(sorted(pending.keys()))
-    if not _is_summary_complete_for_date(yesterday):
-        queue.append(yesterday)
-    if _should_run_today(now):
-        queue.append(today)
+        pending = _load_pending()
 
-    # preserve order, unique
-    seen: set[str] = set()
-    ordered: list[str] = []
-    for d in queue:
-        if d in seen:
-            continue
-        seen.add(d)
-        ordered.append(d)
+        queue: list[str] = []
+        queue.extend(sorted(pending.keys()))
+        if not _is_snapshot_complete_for_date(yesterday):
+            queue.append(yesterday)
+        if _should_run_today(now):
+            queue.append(today)
 
-    if not ordered:
-        print("[daily] No target dates to process.")
-        return 0
+        # preserve order, unique
+        seen: set[str] = set()
+        ordered: list[str] = []
+        for d in queue:
+            if d in seen:
+                continue
+            seen.add(d)
+            ordered.append(d)
 
-    processed = 0
-    for date in ordered:
-        # Skip when already complete.
-        if _is_summary_complete_for_date(date):
-            _clear_pending(pending, date)
-            continue
-        try:
-            print(f"[daily] Running summarize: {date}")
-            out_path = summarize_day_to_markdown(date)
-            processed += 1
-            try:
-                text = out_path.read_text(encoding="utf-8")
-            except Exception:
-                text = ""
-            incomplete_reason = _llm_incomplete_reason_from_markdown(text)
-            if incomplete_reason:
-                _mark_pending(pending, date, f"LLM incomplete ({incomplete_reason})")
-            else:
-                print(f"[daily] Summarize succeeded: {date}")
+        if not ordered:
+            print("[daily] No target dates to process.")
+            return 0
+
+        processed = 0
+        for date in ordered:
+            if _is_snapshot_complete_for_date(date):
                 _clear_pending(pending, date)
-        except Exception as e:
-            _mark_pending(pending, date, str(e))
+                continue
+            try:
+                print(f"[daily] Building snapshot: {date}")
+                out_path = build_day_snapshot(date)
+                processed += 1
+                try:
+                    data = json.loads(out_path.read_text(encoding="utf-8"))
+                except Exception:
+                    data = {}
+                if str(data.get("status") or "").strip() != "complete":
+                    reason = str(data.get("incomplete_reason") or "snapshot_incomplete")
+                    _mark_pending(pending, date, reason)
+                else:
+                    print(f"[daily] Snapshot succeeded: {date}")
+                    _clear_pending(pending, date)
+            except Exception as e:
+                _mark_pending(pending, date, str(e))
 
-    _save_pending(pending)
-    return processed
-
+        _save_pending(pending)
+        run_weekly_automation(retry_pending_only=True)
+        return processed

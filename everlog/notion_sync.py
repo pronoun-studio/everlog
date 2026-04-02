@@ -195,6 +195,60 @@ def _find_page_by_date(database_id: str, date: str) -> dict[str, Any] | None:
         return None
 
 
+def _find_weekly_page_by_week_start(database_id: str, week_start: str) -> dict[str, Any] | None:
+    from datetime import datetime, timedelta
+
+    try:
+        dt = datetime.strptime(week_start, "%Y-%m-%d")
+        next_day = (dt + timedelta(days=1)).strftime("%Y-%m-%d")
+    except ValueError:
+        next_day = week_start
+
+    body = {
+        "filter": {
+            "and": [
+                {
+                    "property": "ジャンル",
+                    "multi_select": {
+                        "contains": "AutoLog",
+                    },
+                },
+                {
+                    "or": [
+                        {
+                            "property": "実施日_編集可",
+                            "date": {
+                                "equals": week_start,
+                            },
+                        },
+                        {
+                            "property": "実施日_編集可",
+                            "date": {
+                                "equals": next_day,
+                            },
+                        },
+                    ]
+                },
+            ]
+        },
+        "page_size": 20,
+        "sorts": [{"property": "作成日時", "direction": "descending"}],
+    }
+    try:
+        result = _notion_request("POST", f"/databases/{database_id}/query", body)
+        results = result.get("results") or []
+        prefix = "週次レポート "
+        for page in results:
+            props = page.get("properties", {})
+            title_prop = props.get("活動ログ", {}).get("title", [])
+            title = title_prop[0]["plain_text"] if title_prop else ""
+            if title.startswith(prefix) and week_start in title:
+                return page
+        return None
+    except NotionSyncError:
+        return None
+
+
 def _md_to_notion_blocks(md_content: str) -> list[dict[str, Any]]:
     """マークダウンをNotionブロックに変換する"""
     blocks: list[dict[str, Any]] = []
@@ -492,6 +546,32 @@ def sync_daily(
     except Exception as e:
         mark_pending(date, run_id, md_path, daily_llm_path, f"Unexpected error: {e}")
         return False
+
+
+def sync_weekly(
+    week_start: str,
+    week_end: str,
+    md_path: Path,
+) -> bool:
+    database_id = _get_database_id()
+    if not md_path.exists():
+        raise NotionSyncError(f"Markdown file not found: {md_path}")
+
+    title = f"週次レポート {week_start} - {week_end}"
+    md_content = md_path.read_text(encoding="utf-8")
+    blocks = _md_to_notion_blocks(md_content)
+    existing = _find_weekly_page_by_week_start(database_id, week_start)
+
+    if existing:
+        page_id = existing["id"]
+        _update_page(page_id, title, week_start, blocks)
+        print(f"[notion_sync] Updated weekly page: {week_start}")
+        _fix_date_after_automation(page_id, week_start)
+    else:
+        result = _create_page(database_id, title, week_start, blocks)
+        print(f"[notion_sync] Created weekly page: {week_start}")
+        _fix_date_after_automation(result["id"], week_start)
+    return True
 
 
 def retry_pending() -> int:

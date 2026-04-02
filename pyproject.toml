@@ -9,7 +9,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "everlog"
 version = "0.1.0"
-description = "macOS screenshot + local OCR worklog (JSONL) and daily Markdown summary"
+description = "macOS screenshot + local OCR worklog (JSONL), daily snapshots, and weekly reports"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "Proprietary" }

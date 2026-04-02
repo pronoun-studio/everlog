@@ -30,9 +30,16 @@ from .launchd import (
     launchd_menubar_stop,
     launchd_menubar_stop_for_quit,
     launchd_menubar_uninstall,
+    launchd_weekly_install,
+    launchd_weekly_restart,
+    launchd_weekly_start,
+    launchd_weekly_status,
+    launchd_weekly_stop,
+    launchd_weekly_uninstall,
 )
 from .menubar import run_menubar
 from .summarize import summarize_day_to_markdown
+from .weekly import build_weekly_report_hourly_only_preview, run_weekly_automation
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -42,16 +49,30 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     p_capture = sub.add_parser("capture", help="Capture screenshot → OCR → append JSONL")
     p_capture.add_argument("--force", action="store_true", help="Capture even if excluded/locked heuristics match")
 
-    p_sum = sub.add_parser("summarize", help="Summarize JSONL into daily Markdown")
+    p_sum = sub.add_parser("summarize", help="Legacy: summarize JSONL into daily Markdown")
     p_sum.add_argument("--date", default="today", help="YYYY-MM-DD or 'today'")
-    sub.add_parser("daily-run", help="Run daily summarize orchestration (pending/yesterday/today)")
+    sub.add_parser("daily-run", help="Run daily snapshot orchestration (pending/yesterday/today)")
+    p_weekly = sub.add_parser("weekly-run", help="Run weekly report generation")
+    p_weekly.add_argument("--week-start", default=None, help="Monday in YYYY-MM-DD format")
+    p_weekly.add_argument("--retry-pending-only", action="store_true", help="Retry pending weeks only")
+    p_weekly.add_argument("--force", action="store_true", help="Regenerate even if output already exists")
+    p_weekly.add_argument(
+        "--output-name",
+        default=None,
+        help="Write the weekly markdown to this filename under weeks/<week_start>/ instead of weekly.report.md",
+    )
+    p_weekly.add_argument(
+        "--hourly-only-preview",
+        action="store_true",
+        help="Write an experimental weekly.report.hourly-only.md using only hour-llm summaries",
+    )
 
     p_enrich = sub.add_parser("enrich", help="Enrich JSONL via LLM (writes out/YYYY-MM-DD.llm.json)")
     p_enrich.add_argument("--date", default="today", help="YYYY-MM-DD or 'today'")
     p_enrich.add_argument(
         "--model",
         default=None,
-        help="LLM model (default: EVERLOG_LLM_MODEL or gpt-5-nano; legacy: EVERYTIMECAPTURE_LLM_MODEL)",
+        help="Deprecated; model is fixed to gpt-5-nano",
     )
     p_enrich.add_argument("--max-segments", type=int, default=80, help="Max segments to send")
 
@@ -77,7 +98,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     sub4.add_parser("uninstall", help="Unload agent and remove plist")
     sub4.add_parser("quit", help="Stop agent and disable autostart")
 
-    p_l_daily = sub2.add_parser("daily", help="Daily enrich+summarize agent (23:55)")
+    p_l_daily = sub2.add_parser("daily", help="Daily snapshot agent (23:55)")
     sub5 = p_l_daily.add_subparsers(dest="launchd_cmd3", required=True)
     sub5.add_parser("install", help="Write plist and (re)load agent")
     sub5.add_parser("start", help="Load agent")
@@ -85,6 +106,15 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     sub5.add_parser("restart", help="Kickstart agent")
     sub5.add_parser("status", help="Print agent status")
     sub5.add_parser("uninstall", help="Unload agent and remove plist")
+
+    p_l_weekly = sub2.add_parser("weekly", help="Weekly report agent (Mon 00:05)")
+    sub6 = p_l_weekly.add_subparsers(dest="launchd_cmd4", required=True)
+    sub6.add_parser("install", help="Write plist and (re)load agent")
+    sub6.add_parser("start", help="Load agent")
+    sub6.add_parser("stop", help="Unload agent")
+    sub6.add_parser("restart", help="Kickstart agent")
+    sub6.add_parser("status", help="Print agent status")
+    sub6.add_parser("uninstall", help="Unload agent and remove plist")
 
     sub.add_parser("menubar", help="Run menu bar UI (requires rumps)")
     sub.add_parser("quit", help="Stop menubar and capture (disable autostart)")
@@ -101,6 +131,20 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     if args.cmd == "daily-run":
         run_daily_automation()
+        return 0
+    if args.cmd == "weekly-run":
+        if args.hourly_only_preview:
+            build_weekly_report_hourly_only_preview(
+                args.week_start,
+                force=args.force,
+            )
+            return 0
+        run_weekly_automation(
+            week_start=args.week_start,
+            retry_pending_only=args.retry_pending_only,
+            force=args.force,
+            output_name=args.output_name,
+        )
         return 0
     if args.cmd == "enrich":
         enrich_day_with_llm(args.date, model=args.model, max_segments=args.max_segments)
@@ -147,6 +191,19 @@ def main(argv: list[str] | None = None) -> int:
                 launchd_daily_status()
             elif args.launchd_cmd3 == "uninstall":
                 launchd_daily_uninstall()
+        elif args.launchd_target == "weekly":
+            if args.launchd_cmd4 == "install":
+                launchd_weekly_install()
+            elif args.launchd_cmd4 == "start":
+                launchd_weekly_start()
+            elif args.launchd_cmd4 == "stop":
+                launchd_weekly_stop()
+            elif args.launchd_cmd4 == "restart":
+                launchd_weekly_restart()
+            elif args.launchd_cmd4 == "status":
+                launchd_weekly_status()
+            elif args.launchd_cmd4 == "uninstall":
+                launchd_weekly_uninstall()
         return 0
     if args.cmd == "menubar":
         run_menubar()
@@ -154,6 +211,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "quit":
         launchd_capture_uninstall()
         launchd_menubar_uninstall()
+        launchd_daily_uninstall()
+        launchd_weekly_uninstall()
         return 0
     raise AssertionError("unreachable")
 

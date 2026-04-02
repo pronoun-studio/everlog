@@ -17,10 +17,12 @@ from .paths import get_paths, _project_root
 CAPTURE_LABEL = "com.everlog.capture"
 MENUBAR_LABEL = "com.everlog.menubar"
 DAILY_LABEL = "com.everlog.daily"
+WEEKLY_LABEL = "com.everlog.weekly"
 
 LEGACY_CAPTURE_LABEL = "com.everytimecapture.capture"
 LEGACY_MENUBAR_LABEL = "com.everytimecapture.menubar"
 LEGACY_DAILY_LABEL = "com.everytimecapture.daily"
+LEGACY_WEEKLY_LABEL = "com.everytimecapture.weekly"
 
 
 def _uid() -> str:
@@ -148,19 +150,12 @@ def _write_plist_capture(interval_sec: int) -> None:
 
 
 def _write_plist_daily() -> None:
-    """日次オーケストレーションを実行するplistを生成する。"""
+    """日次スナップショット補完を実行するplistを生成する。"""
     agents = _launchagents_dir()
     agents.mkdir(parents=True, exist_ok=True)
     plist = _plist_path(DAILY_LABEL)
-    cfg = load_config()
     python = _python_executable()
-    # Run the daily orchestrator:
-    # - 23:55 regular run: process pending + today
-    # - RunAtLoad run: process pending + yesterday backfill
-    script = (
-        f"EVERLOG_HOURLY_LLM=1 EVERLOG_DAILY_LLM=1 EVERLOG_HOUR_ENRICH_LLM=1 "
-        f"EVERLOG_LLM_TIMEOUT_SEC=300 {python} -m everlog.cli daily-run"
-    )
+    script = f"EVERLOG_LLM_TIMEOUT_SEC=300 {python} -m everlog.cli daily-run"
     env_xml = _env_dict_xml()
     content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -188,6 +183,47 @@ def _write_plist_daily() -> None:
   <string>{Path.home()}/.everlog/daily.out.log</string>
   <key>StandardErrorPath</key>
   <string>{Path.home()}/.everlog/daily.err.log</string>
+</dict>
+</plist>
+"""
+    plist.write_text(content, encoding="utf-8")
+
+
+def _write_plist_weekly() -> None:
+    agents = _launchagents_dir()
+    agents.mkdir(parents=True, exist_ok=True)
+    plist = _plist_path(WEEKLY_LABEL)
+    python = _python_executable()
+    script = f"EVERLOG_LLM_TIMEOUT_SEC=300 {python} -m everlog.cli weekly-run"
+    env_xml = _env_dict_xml()
+    content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{WEEKLY_LABEL}</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/sh</string>
+    <string>-c</string>
+    <string>{script}</string>
+  </array>
+{env_xml}
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Weekday</key>
+    <integer>1</integer>
+    <key>Hour</key>
+    <integer>0</integer>
+    <key>Minute</key>
+    <integer>5</integer>
+  </dict>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>{Path.home()}/.everlog/weekly.out.log</string>
+  <key>StandardErrorPath</key>
+  <string>{Path.home()}/.everlog/weekly.err.log</string>
 </dict>
 </plist>
 """
@@ -263,6 +299,8 @@ def _legacy_labels_for(label: str) -> list[str]:
         return [MENUBAR_LABEL, LEGACY_MENUBAR_LABEL]
     if label == DAILY_LABEL:
         return [DAILY_LABEL, LEGACY_DAILY_LABEL]
+    if label == WEEKLY_LABEL:
+        return [WEEKLY_LABEL, LEGACY_WEEKLY_LABEL]
     return [label]
 
 
@@ -313,6 +351,8 @@ def launchd_capture_uninstall() -> None:
 
 
 def launchd_menubar_install() -> None:
+    launchd_daily_install()
+    launchd_weekly_install()
     _write_plist_menubar()
     _stop_all(MENUBAR_LABEL)  # 既に停止済みでもエラーを表示しない
     launchd_menubar_start()
@@ -342,6 +382,8 @@ def launchd_menubar_status() -> None:
 def launchd_menubar_uninstall() -> None:
     _uninstall(MENUBAR_LABEL)
     _uninstall(LEGACY_MENUBAR_LABEL)
+    launchd_daily_uninstall()
+    launchd_weekly_uninstall()
 
 
 # --- Daily (enrich + summarize at 23:55) ---
@@ -371,3 +413,30 @@ def launchd_daily_status() -> None:
 def launchd_daily_uninstall() -> None:
     _uninstall(DAILY_LABEL)
     _uninstall(LEGACY_DAILY_LABEL)
+
+
+def launchd_weekly_install() -> None:
+    _write_plist_weekly()
+    _stop_all(WEEKLY_LABEL)
+    launchd_weekly_start()
+
+
+def launchd_weekly_start() -> None:
+    _start(WEEKLY_LABEL)
+
+
+def launchd_weekly_stop() -> None:
+    _stop_all(WEEKLY_LABEL)
+
+
+def launchd_weekly_restart() -> None:
+    _restart_any(WEEKLY_LABEL)
+
+
+def launchd_weekly_status() -> None:
+    _status_any(WEEKLY_LABEL)
+
+
+def launchd_weekly_uninstall() -> None:
+    _uninstall(WEEKLY_LABEL)
+    _uninstall(LEGACY_WEEKLY_LABEL)

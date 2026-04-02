@@ -11,7 +11,7 @@ import json
 import os
 
 from .jsonl import read_jsonl
-from .llm import analyze_segments, calc_cost_usd
+from .llm import DEFAULT_LLM_MODEL, analyze_segments, calc_cost_usd
 from .paths import ensure_dirs, get_paths
 from .segments import build_segments
 from .timeutil import normalize_date_arg
@@ -76,7 +76,7 @@ def enrich_day_with_llm(
         truncated = True
 
     api_key = os.environ.get("OPENAI_API_KEY", "")
-    model_name = model or os.environ.get("EVERLOG_LLM_MODEL") or os.environ.get("EVERYTIMECAPTURE_LLM_MODEL", "gpt-5-nano")
+    model_name = DEFAULT_LLM_MODEL
 
     llm_result = analyze_segments(date, seg_dicts, model_name, api_key)
     merged = _merge_llm_output(seg_dicts, llm_result.data)

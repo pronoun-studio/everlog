@@ -93,9 +93,9 @@ def _out_retention_days() -> int:
         or ""
     ).strip()
     try:
-        v = int(raw) if raw else 7
+        v = int(raw) if raw else 14
     except Exception:
-        v = 7
+        v = 14
     return max(1, v)
 
 
